@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""
+Qwen3-TTS local /speak server for AImaster (qwen-tts==0.1.1)
+
+- POST /speak  {"text":"..."}  -> returns audio/wav bytes
+- Optional fields: speaker, language, instruct
+- GET  /speakers   -> supported speakers
+- GET  /languages  -> supported languages
+
+Defaults can be overridden via env:
+  QWEN_TTS_MODEL   (default: Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice)
+  QWEN_SPEAKER     (default: ryan)
+  QWEN_LANG        (default: english)
+  QWEN_INSTRUCT    (default: "Read the text clearly, naturally, and conversationally.")
+"""
+
+import io
+import os
+import traceback
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
+from pydantic import BaseModel
+
+import torch
+import soundfile as sf
+
+from qwen_tts import Qwen3TTSModel
+
+# ----------------------------
+# Configuration
+# ----------------------------
+
+MODEL_ID = os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+DTYPE = torch.float16 if DEVICE.startswith("cuda") else torch.float32  # GTX1080: fp16 OK, bf16 not
+
+DEFAULT_SPEAKER = os.environ.get("QWEN_SPEAKER", "ryan").strip().lower()
+DEFAULT_LANG = os.environ.get("QWEN_LANG", "english").strip().lower()
+DEFAULT_INSTRUCT = os.environ.get(
+    "QWEN_INSTRUCT",
+    "Read the text clearly, naturally, and conversationally.",
+).strip()
+
+# ----------------------------
+# FastAPI app + request model
+# ----------------------------
+
+app = FastAPI()
+
+
+class SpeakReq(BaseModel):
+    text: str
+    speaker: str | None = None
+    language: str | None = None
+    instruct: str | None = None
+
+
+# ----------------------------
+# Load model once at startup
+# ----------------------------
+
+print(f"[qwen-speak] loading {MODEL_ID} on {DEVICE} dtype={DTYPE}")
+model = Qwen3TTSModel.from_pretrained(MODEL_ID, device_map=DEVICE, dtype=DTYPE)
+
+# Cache supported options
+try:
+    SUPPORTED_LANGS = [x.strip().lower() for x in model.get_supported_languages()]
+except Exception:
+    SUPPORTED_LANGS = []
+
+try:
+    SUPPORTED_SPEAKERS = [x.strip().lower() for x in model.get_supported_speakers()]
+except Exception:
+    SUPPORTED_SPEAKERS = []
+
+
+# ----------------------------
+# Helper endpoints
+# ----------------------------
+
+@app.get("/languages")
+def languages():
+    return {"languages": SUPPORTED_LANGS}
+
+
+@app.get("/speakers")
+def speakers():
+    return {"speakers": SUPPORTED_SPEAKERS}
+
+
+# ----------------------------
+# Main /speak endpoint
+# ----------------------------
+
+@app.post("/speak")
+def speak(req: SpeakReq):
+    text = (req.text or "").strip()
+    if not text:
+        return Response(status_code=204)
+
+    speaker = (req.speaker or DEFAULT_SPEAKER).strip().lower()
+    language = (req.language or DEFAULT_LANG).strip().lower()
+    instruct = (req.instruct or DEFAULT_INSTRUCT).strip()
+
+    if SUPPORTED_SPEAKERS and speaker not in SUPPORTED_SPEAKERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported speaker '{speaker}'. Use GET /speakers",
+        )
+    if SUPPORTED_LANGS and language not in SUPPORTED_LANGS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported language '{language}'. Use GET /languages",
+        )
+
+    try:
+        with torch.inference_mode():
+            # qwen-tts==0.1.1 requires 'instruct'
+            result = model.generate_voice_design(
+                text=text,
+                speaker=speaker,
+                language=language,
+                instruct=instruct,
+            )
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Normalize return type: (wav, sr) or dict with audio + sample_rate
+    wav = None
+    sr = None
+
+    if isinstance(result, (tuple, list)) and len(result) >= 2:
+        wav, sr = result[0], int(result[1])
+    elif isinstance(result, dict):
+        wav = result.get("audio") or result.get("wav") or result.get("waveform")
+        sr = result.get("sample_rate") or result.get("sr") or result.get("rate")
+        if wav is None or sr is None:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unexpected dict return keys: {list(result.keys())}",
+            )
+        sr = int(sr)
+    else:
+        raise HTTPException(status_code=500, detail=f"Unexpected return type: {type(result)}")
+
+    buf = io.BytesIO()
+    sf.write(buf, wav, sr, format="WAV")
+    return Response(content=buf.getvalue(), media_type="audio/wav")
+

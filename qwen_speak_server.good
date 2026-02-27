@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""
+Qwen3-TTS local /speak server for AImaster (qwen-tts==0.1.1)
+
+Compatible with:
+  Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+
+- POST /speak  {"text":"..."} -> returns audio/wav bytes
+  Optional: speaker, language, instruct
+- GET /speakers, /languages
+
+Stability defaults for GTX 1080 / Pascal:
+- dtype=torch.float32 (prevents fp16 NaNs)
+- do_sample=False (greedy decoding; avoids multinomial sampling asserts)
+
+Env overrides:
+  QWEN_TTS_MODEL   (default: Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice)
+  QWEN_SPEAKER     (default: ryan)
+  QWEN_LANG        (default: english)
+  QWEN_INSTRUCT    (default: "Read the text clearly, naturally, and conversationally.")
+"""
+
+import io
+import os
+import traceback
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
+from pydantic import BaseModel
+
+import numpy as np
+import torch
+import soundfile as sf
+
+from qwen_tts import Qwen3TTSModel
+
+MODEL_ID = os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+# Pascal stability: force fp32 even on CUDA
+DTYPE = torch.float32
+
+DEFAULT_SPEAKER = os.environ.get("QWEN_SPEAKER", "ryan").strip().lower()
+DEFAULT_LANG = os.environ.get("QWEN_LANG", "english").strip().lower()
+DEFAULT_INSTRUCT = os.environ.get(
+    "QWEN_INSTRUCT",
+    "Read the text clearly, naturally, and conversationally.",
+).strip()
+
+# Generation safety: avoid sampling path (multinomial) entirely
+GEN_KWARGS = {
+    "do_sample": False,
+    "num_beams": 1,
+    # temperature/top_p/top_k are ignored when do_sample=False, but harmless:
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 0,
+}
+
+app = FastAPI()
+
+class SpeakReq(BaseModel):
+    text: str
+    speaker: str | None = None
+    language: str | None = None
+    instruct: str | None = None
+
+print(f"[qwen-speak] loading {MODEL_ID} on {DEVICE} dtype={DTYPE}")
+model = Qwen3TTSModel.from_pretrained(MODEL_ID, device_map=DEVICE, dtype=DTYPE)
+
+try:
+    SUPPORTED_LANGS = [x.strip().lower() for x in model.get_supported_languages()]
+except Exception:
+    SUPPORTED_LANGS = []
+
+try:
+    SUPPORTED_SPEAKERS = [x.strip().lower() for x in model.get_supported_speakers()]
+except Exception:
+    SUPPORTED_SPEAKERS = []
+
+@app.get("/languages")
+def languages():
+    return {"languages": SUPPORTED_LANGS}
+
+@app.get("/speakers")
+def speakers():
+    return {"speakers": SUPPORTED_SPEAKERS}
+
+def _concat_audio(chunks: list[np.ndarray]) -> np.ndarray:
+    """Concatenate a list of 1-D numpy arrays into one."""
+    if not chunks:
+        return np.zeros((0,), dtype=np.float32)
+    # ensure 1-D float32
+    fixed = []
+    for c in chunks:
+        a = np.asarray(c)
+        if a.ndim > 1:
+            a = a.squeeze()
+        fixed.append(a.astype(np.float32, copy=False))
+    return np.concatenate(fixed, axis=0)
+
+@app.post("/speak")
+def speak(req: SpeakReq):
+    text = (req.text or "").strip()
+    if not text:
+        return Response(status_code=204)
+
+    speaker = (req.speaker or DEFAULT_SPEAKER).strip().lower()
+    language = (req.language or DEFAULT_LANG).strip().lower()
+    instruct = (req.instruct or DEFAULT_INSTRUCT).strip()
+
+    if SUPPORTED_SPEAKERS and speaker not in SUPPORTED_SPEAKERS:
+        raise HTTPException(status_code=400, detail=f"Unsupported speaker '{speaker}'. Use GET /speakers")
+    if SUPPORTED_LANGS and language not in SUPPORTED_LANGS:
+        raise HTTPException(status_code=400, detail=f"Unsupported language '{language}'. Use GET /languages")
+
+    try:
+        with torch.inference_mode():
+            # Returns: (List[np.ndarray], sample_rate)
+            audio_list, sr = model.generate_custom_voice(
+                text=text,
+                speaker=speaker,
+                language=language,
+                instruct=instruct,
+                non_streaming_mode=True,
+                **GEN_KWARGS,
+            )
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    wav = _concat_audio(audio_list)
+    if wav.size == 0:
+        raise HTTPException(status_code=500, detail="Empty audio output from model")
+
+    buf = io.BytesIO()
+    sf.write(buf, wav, int(sr), format="WAV")
+    return Response(content=buf.getvalue(), media_type="audio/wav")
+

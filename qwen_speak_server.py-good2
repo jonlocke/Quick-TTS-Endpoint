@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""
+Qwen3-TTS local /speak server for AImaster (qwen-tts==0.1.1)
+
+Compatible with:
+  Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+
+Endpoints:
+- POST /speak  {"text":"..."} -> returns audio/wav bytes
+  Optional: speaker, language, instruct
+- GET /speakers, /languages
+
+RTX 2060 speed + stability strategy:
+- Load weights in fp16 on CUDA for speed
+- FORCE greedy decoding via generation_config on *internal* HF components
+  (prevents multinomial sampling path that triggers CUDA asserts)
+- Optional autocast compute to fp32 for extra stability if needed
+
+Env overrides:
+  QWEN_TTS_MODEL     default: Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+  QWEN_SPEAKER       default: ryan
+  QWEN_LANG          default: english
+  QWEN_INSTRUCT      default: "Read the text clearly, naturally, and conversationally."
+  QWEN_AUTOMIX_FP32  default: 0  (set to 1 to autocast compute to fp32 on CUDA)
+"""
+
+import io
+import os
+import traceback
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
+from pydantic import BaseModel
+
+import numpy as np
+import torch
+import soundfile as sf
+
+from qwen_tts import Qwen3TTSModel
+
+MODEL_ID = os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+# Speed: fp16 weights on RTX 2060 are typically stable
+#DTYPE = torch.float16 if DEVICE.startswith("cuda") else torch.float32
+DTYPE = torch.float32 
+
+# Optional: run compute in fp32 while keeping fp16 weights (extra stability)
+AUTOMIX_FP32 = os.environ.get("QWEN_AUTOMIX_FP32", "0").strip() in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
+
+# Cheap speed win on NVIDIA: allow TF32 (mostly helps matmuls/convs)
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+DEFAULT_SPEAKER = os.environ.get("QWEN_SPEAKER", "ryan").strip().lower()
+DEFAULT_LANG = os.environ.get("QWEN_LANG", "english").strip().lower()
+DEFAULT_INSTRUCT = os.environ.get(
+    "QWEN_INSTRUCT",
+    "Read the text clearly, naturally, and conversationally.",
+).strip()
+
+# Still pass best-effort generation kwargs, but we don't rely on these being forwarded.
+GEN_KWARGS = {
+    "do_sample": False,
+    "num_beams": 1,
+    "temperature": 1.0,
+    "top_p": 1.0,
+}
+
+app = FastAPI()
+
+
+class SpeakReq(BaseModel):
+    text: str
+    speaker: str | None = None
+    language: str | None = None
+    instruct: str | None = None
+
+
+def force_greedy(obj, label: str):
+    """
+    Best-effort: disable sampling on any HF model with a generation_config.
+    This prevents the multinomial sampling path that can trigger CUDA asserts.
+    """
+    try:
+        if hasattr(obj, "generation_config") and obj.generation_config is not None:
+            gc = obj.generation_config
+            gc.do_sample = False
+            gc.num_beams = 1
+            gc.temperature = 1.0
+            gc.top_p = 1.0
+            if hasattr(gc, "top_k"):
+                gc.top_k = 0
+            print(f"[qwen-speak] forced greedy on {label}")
+    except Exception as e:
+        print(f"[qwen-speak] could not force greedy on {label}: {e}")
+
+
+print(f"[qwen-speak] loading {MODEL_ID} on {DEVICE} dtype={DTYPE}")
+model = Qwen3TTSModel.from_pretrained(MODEL_ID, device_map=DEVICE, dtype=DTYPE)
+
+# Force greedy decoding on internal components (critical for stability)
+try:
+    # Core wrapped model
+    force_greedy(model.model, "model.model")
+
+    # Common submodules used internally
+    for sub_name in ("talker", "code_predictor"):
+        if hasattr(model.model, sub_name):
+            force_greedy(getattr(model.model, sub_name), f"model.model.{sub_name}")
+except Exception as e:
+    print("[qwen-speak] warning: could not apply greedy forcing:", e)
+
+# NOTE: leave torch.compile OFF until everything is stable. You can re-enable later.
+
+
+try:
+    SUPPORTED_LANGS = [x.strip().lower() for x in model.get_supported_languages()]
+except Exception:
+    SUPPORTED_LANGS = []
+
+try:
+    SUPPORTED_SPEAKERS = [x.strip().lower() for x in model.get_supported_speakers()]
+except Exception:
+    SUPPORTED_SPEAKERS = []
+
+
+@app.get("/languages")
+def languages():
+    return {"languages": SUPPORTED_LANGS}
+
+
+@app.get("/speakers")
+def speakers():
+    return {"speakers": SUPPORTED_SPEAKERS}
+
+
+def _concat_audio(chunks: list[np.ndarray]) -> np.ndarray:
+    """Concatenate a list of 1-D numpy arrays into one float32 array."""
+    if not chunks:
+        return np.zeros((0,), dtype=np.float32)
+    fixed = []
+    for c in chunks:
+        a = np.asarray(c)
+        if a.ndim > 1:
+            a = a.squeeze()
+        fixed.append(a.astype(np.float32, copy=False))
+    return np.concatenate(fixed, axis=0)
+
+
+@app.post("/speak")
+def speak(req: SpeakReq):
+    text = (req.text or "").strip()
+    if not text:
+        return Response(status_code=204)
+
+    speaker = (req.speaker or DEFAULT_SPEAKER).strip().lower()
+    language = (req.language or DEFAULT_LANG).strip().lower()
+    instruct = (req.instruct or DEFAULT_INSTRUCT).strip()
+
+    if SUPPORTED_SPEAKERS and speaker not in SUPPORTED_SPEAKERS:
+        raise HTTPException(status_code=400, detail=f"Unsupported speaker '{speaker}'. Use GET /speakers")
+    if SUPPORTED_LANGS and language not in SUPPORTED_LANGS:
+        raise HTTPException(status_code=400, detail=f"Unsupported language '{language}'. Use GET /languages")
+
+    try:
+        with torch.inference_mode():
+            # Optional: compute in fp32 for stability while weights remain fp16
+            if DEVICE.startswith("cuda") and AUTOMIX_FP32:
+                with torch.autocast(device_type="cuda", dtype=torch.float32, enabled=True):
+                    audio_list, sr = model.generate_custom_voice(
+                        text=text,
+                        speaker=speaker,
+                        language=language,
+                        instruct=instruct,
+                        non_streaming_mode=True,
+                        **GEN_KWARGS,
+                    )
+            else:
+                audio_list, sr = model.generate_custom_voice(
+                    text=text,
+                    speaker=speaker,
+                    language=language,
+                    instruct=instruct,
+                    non_streaming_mode=True,
+                    **GEN_KWARGS,
+                )
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    wav = _concat_audio(audio_list)
+    if wav.size == 0:
+        raise HTTPException(status_code=500, detail="Empty audio output from model")
+
+    buf = io.BytesIO()
+    sf.write(buf, wav, int(sr), format="WAV")
+    return Response(content=buf.getvalue(), media_type="audio/wav")
+

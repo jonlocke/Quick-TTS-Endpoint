@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+import io
+import os
+import traceback
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
+from pydantic import BaseModel
+
+import numpy as np
+import torch
+import soundfile as sf
+
+from qwen_tts import Qwen3TTSModel
+
+MODEL_ID = os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+# RTX 2060 (Turing): fp16 is typically stable + much faster
+DTYPE = torch.float16 if DEVICE.startswith("cuda") else torch.float32
+
+# Cheap speed win on NVIDIA: allow TF32 (mostly helps matmuls/convs)
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+DEFAULT_SPEAKER = os.environ.get("QWEN_SPEAKER", "ryan").strip().lower()
+DEFAULT_LANG = os.environ.get("QWEN_LANG", "english").strip().lower()
+DEFAULT_INSTRUCT = os.environ.get(
+    "QWEN_INSTRUCT",
+    "Read the text clearly, naturally, and conversationally.",
+).strip()
+
+# Avoid multinomial sampling path entirely
+GEN_KWARGS = {
+    "do_sample": False,
+    "num_beams": 1,
+    "temperature": 1.0,
+    "top_p": 1.0,
+}
+
+app = FastAPI()
+
+class SpeakReq(BaseModel):
+    text: str
+    speaker: str | None = None
+    language: str | None = None
+    instruct: str | None = None
+
+print(f"[qwen-speak] loading {MODEL_ID} on {DEVICE} dtype={DTYPE}")
+model = Qwen3TTSModel.from_pretrained(MODEL_ID, device_map=DEVICE, dtype=DTYPE)
+
+# Optional speed-up (PyTorch 2.x). Safe to ignore if it errors.
+try:
+    model.model = torch.compile(model.model, mode="reduce-overhead")
+    print("[qwen-speak] torch.compile enabled")
+except Exception as e:
+    print("[qwen-speak] torch.compile not enabled:", e)
+
+try:
+    SUPPORTED_LANGS = [x.strip().lower() for x in model.get_supported_languages()]
+except Exception:
+    SUPPORTED_LANGS = []
+
+try:
+    SUPPORTED_SPEAKERS = [x.strip().lower() for x in model.get_supported_speakers()]
+except Exception:
+    SUPPORTED_SPEAKERS = []
+
+def _concat_audio(chunks: list[np.ndarray]) -> np.ndarray:
+    if not chunks:
+        return np.zeros((0,), dtype=np.float32)
+    fixed = []
+    for c in chunks:
+        a = np.asarray(c)
+        if a.ndim > 1:
+            a = a.squeeze()
+        fixed.append(a.astype(np.float32, copy=False))
+    return np.concatenate(fixed, axis=0)
+
+@app.get("/languages")
+def languages():
+    return {"languages": SUPPORTED_LANGS}
+
+@app.get("/speakers")
+def speakers():
+    return {"speakers": SUPPORTED_SPEAKERS}
+
+@app.post("/speak")
+def speak(req: SpeakReq):
+    text = (req.text or "").strip()
+    if not text:
+        return Response(status_code=204)
+
+    speaker = (req.speaker or DEFAULT_SPEAKER).strip().lower()
+    language = (req.language or DEFAULT_LANG).strip().lower()
+    instruct = (req.instruct or DEFAULT_INSTRUCT).strip()
+
+    if SUPPORTED_SPEAKERS and speaker not in SUPPORTED_SPEAKERS:
+        raise HTTPException(status_code=400, detail=f"Unsupported speaker '{speaker}'. Use GET /speakers")
+    if SUPPORTED_LANGS and language not in SUPPORTED_LANGS:
+        raise HTTPException(status_code=400, detail=f"Unsupported language '{language}'. Use GET /languages")
+
+    try:
+        with torch.inference_mode():
+            audio_list, sr = model.generate_custom_voice(
+                text=text,
+                speaker=speaker,
+                language=language,
+                instruct=instruct,
+                non_streaming_mode=True,
+                **GEN_KWARGS,
+            )
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    wav = _concat_audio(audio_list)
+    if wav.size == 0:
+        raise HTTPException(status_code=500, detail="Empty audio output from model")
+
+    buf = io.BytesIO()
+    sf.write(buf, wav, int(sr), format="WAV")
+    return Response(content=buf.getvalue(), media_type="audio/wav")
+
