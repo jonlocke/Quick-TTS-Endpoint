@@ -30,7 +30,6 @@ Deps (WSL):
   sudo apt-get install -y ffmpeg sox libsox-fmt-all
   pip install fastapi uvicorn soundfile numpy torch qwen-tts
 """
-
 import io
 import os
 import re
@@ -49,6 +48,7 @@ from pydantic import BaseModel
 import numpy as np
 import torch
 import soundfile as sf
+import torch_pytree_patch
 
 from qwen_tts import Qwen3TTSModel
 
