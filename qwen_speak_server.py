@@ -36,6 +36,7 @@ import re
 import tempfile
 import subprocess
 import threading
+import time
 import queue
 import traceback
 from dataclasses import dataclass
@@ -325,6 +326,8 @@ def speak(
     chunk: bool = Query(True, description="If true (default), split into sentence-ish chunks"),
     max_chars: int = Query(240, ge=80, le=800, description="Chunk size cap"),
 ):
+    request_start = time.perf_counter()
+
     text = (req.text or "").strip()
     if not text:
         return Response(status_code=204)
@@ -367,7 +370,8 @@ def speak(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-    completion_message = f"Request complete: {text}"
+    elapsed_seconds = time.perf_counter() - request_start
+    completion_message = f"Request complete in {elapsed_seconds:.3f}s: {text}"
     print(f"{PRINT_PREFIX} {completion_message}", flush=True)
 
     if return_audio and first_wav is not None:
@@ -381,6 +385,7 @@ def speak(
                 "X-Qwen-SampleRate": str(first_sr or ""),
                 "X-Qwen-Chunks": str(len(parts)),
                 "X-Qwen-Chunked": "1" if chunk else "0",
+                "X-Qwen-Processing-Seconds": f"{elapsed_seconds:.3f}",
             },
         )
 
@@ -388,6 +393,7 @@ def speak(
         "ok": True,
         "message": completion_message,
         "text": text,
+        "processing_seconds": round(elapsed_seconds, 3),
         "queued": bool(play),
         "return_audio": bool(return_audio),
         "chunked": bool(chunk),
