@@ -367,11 +367,15 @@ def speak(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+    completion_message = f"Request complete: {text}"
+    print(f"{PRINT_PREFIX} {completion_message}", flush=True)
+
     if return_audio and first_wav is not None:
         return Response(
             content=first_wav,
             media_type="audio/wav",
             headers={
+                "X-Qwen-Request-Status": "complete",
                 "X-Qwen-Speaker": speaker,
                 "X-Qwen-Language": language,
                 "X-Qwen-SampleRate": str(first_sr or ""),
@@ -382,6 +386,8 @@ def speak(
 
     return JSONResponse({
         "ok": True,
+        "message": completion_message,
+        "text": text,
         "queued": bool(play),
         "return_audio": bool(return_audio),
         "chunked": bool(chunk),
@@ -392,4 +398,3 @@ def speak(
         "queue_depth": play_q.qsize(),
         "job_ids": job_ids[:10],  # avoid huge responses
     })
-
