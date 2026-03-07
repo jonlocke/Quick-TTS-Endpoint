@@ -31,6 +31,7 @@ Deps (WSL):
   pip install fastapi uvicorn soundfile numpy torch qwen-tts
 """
 import io
+import inspect
 import os
 import re
 import tempfile
@@ -82,6 +83,9 @@ DEFAULT_INSTRUCT = os.environ.get(
     "Read the text clearly, naturally, and conversationally.",
 ).strip()
 
+TRAIN_WAV_PATH = os.environ.get("QWEN_TRAIN_WAV", "train.wav").strip()
+TRAIN_TXT_PATH = os.environ.get("QWEN_TRAIN_TXT", "tran.txt").strip()
+
 # Generation kwargs (best effort; still force greedy via generation_config)
 GEN_KWARGS = {
     "do_sample": False,
@@ -123,6 +127,70 @@ def force_greedy(obj, label: str):
 
 print(f"{PRINT_PREFIX} loading {MODEL_ID} on {DEVICE} dtype={DTYPE}")
 model = Qwen3TTSModel.from_pretrained(MODEL_ID, device_map=DEVICE, dtype=DTYPE)
+
+_GEN_CUSTOM_VOICE_PARAMS = set(inspect.signature(model.generate_custom_voice).parameters)
+
+
+def _resolve_training_paths() -> tuple[str, str]:
+    """Resolve train.wav / tran.txt using cwd + script directory fallback."""
+    candidates = [
+        (TRAIN_WAV_PATH, TRAIN_TXT_PATH),
+        (
+            os.path.join(os.path.dirname(__file__), TRAIN_WAV_PATH),
+            os.path.join(os.path.dirname(__file__), TRAIN_TXT_PATH),
+        ),
+    ]
+    for wav_path, txt_path in candidates:
+        if os.path.isfile(wav_path) and os.path.isfile(txt_path):
+            return wav_path, txt_path
+
+    raise FileNotFoundError(
+        f"Could not find startup training files. Looked for wav='{TRAIN_WAV_PATH}' and txt='{TRAIN_TXT_PATH}' "
+        f"in cwd and script directory."
+    )
+
+
+def _build_training_voice_kwargs() -> dict:
+    """Load startup voice snippet and map it into supported qwen-tts kwargs."""
+    wav_path, txt_path = _resolve_training_paths()
+
+    with open(txt_path, "r", encoding="utf-8") as f:
+        transcript = f.read().strip()
+    if not transcript:
+        raise RuntimeError(f"Training text file is empty: {txt_path}")
+
+    kwargs: dict = {}
+    if "prompt_audio" in _GEN_CUSTOM_VOICE_PARAMS:
+        kwargs["prompt_audio"] = wav_path
+    elif "audio_prompt_path" in _GEN_CUSTOM_VOICE_PARAMS:
+        kwargs["audio_prompt_path"] = wav_path
+    elif "voice_prompt_path" in _GEN_CUSTOM_VOICE_PARAMS:
+        kwargs["voice_prompt_path"] = wav_path
+    elif "voice" in _GEN_CUSTOM_VOICE_PARAMS:
+        kwargs["voice"] = wav_path
+
+    if "prompt_text" in _GEN_CUSTOM_VOICE_PARAMS:
+        kwargs["prompt_text"] = transcript
+    elif "audio_prompt_text" in _GEN_CUSTOM_VOICE_PARAMS:
+        kwargs["audio_prompt_text"] = transcript
+    elif "voice_prompt_text" in _GEN_CUSTOM_VOICE_PARAMS:
+        kwargs["voice_prompt_text"] = transcript
+
+    if not kwargs:
+        print(
+            f"{PRINT_PREFIX} warning: model API does not expose recognized voice prompt args; "
+            "startup training snippet will not be applied"
+        )
+    else:
+        print(
+            f"{PRINT_PREFIX} loaded startup voice snippet wav={wav_path} txt={txt_path} "
+            f"(keys={sorted(kwargs.keys())})"
+        )
+
+    return kwargs
+
+
+TRAINING_VOICE_KWARGS = _build_training_voice_kwargs()
 
 # Force greedy decoding on internal components (critical for stability)
 try:
@@ -242,6 +310,7 @@ def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: s
                     language=language,
                     instruct=instruct,
                     non_streaming_mode=True,
+                    **TRAINING_VOICE_KWARGS,
                     **GEN_KWARGS,
                 )
         else:
@@ -251,6 +320,7 @@ def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: s
                 language=language,
                 instruct=instruct,
                 non_streaming_mode=True,
+                **TRAINING_VOICE_KWARGS,
                 **GEN_KWARGS,
             )
 
