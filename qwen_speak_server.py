@@ -18,7 +18,7 @@ Designed for GTX 1080 stability:
 - Forces greedy decoding on internal HF components (best-effort)
 
 Env overrides:
-  QWEN_TTS_MODEL      default: Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+  QWEN_TTS_MODEL      default: Qwen/Qwen3-TTS-12Hz-0.6B-Base
   QWEN_SPEAKER        default: ryan
   QWEN_LANG           default: english
   QWEN_INSTRUCT       default: "Read the text clearly, naturally, and conversationally."
@@ -58,7 +58,7 @@ from qwen_tts import Qwen3TTSModel
 # ----------------------------
 # Configuration
 # ----------------------------
-MODEL_ID = os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+MODEL_ID = os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 # GTX 1080 stability: default to fp32 on CUDA; allow override if you upgrade GPU.

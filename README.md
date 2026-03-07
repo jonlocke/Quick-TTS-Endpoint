@@ -1,6 +1,8 @@
 # Quick-TTS-Endpoint
 Just a quick TTS endpoint
 
+Default model is now set to `Qwen/Qwen3-TTS-12Hz-0.6B-Base` (override with `QWEN_TTS_MODEL`).
+
 ## Startup voice snippet training
 
 On startup, the server now attempts to load a training voice snippet and transcript,
