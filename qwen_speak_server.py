@@ -18,7 +18,7 @@ Designed for GTX 1080 stability:
 - Forces greedy decoding on internal HF components (best-effort)
 
 Env overrides:
-  QWEN_TTS_MODEL      default: Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+  QWEN_TTS_MODEL      default: Qwen/Qwen3-TTS-12Hz-0.6B-Base
   QWEN_SPEAKER        default: ryan
   QWEN_LANG           default: english
   QWEN_INSTRUCT       default: "Read the text clearly, naturally, and conversationally."
@@ -31,6 +31,7 @@ Deps (WSL):
   pip install fastapi uvicorn soundfile numpy torch qwen-tts
 """
 import io
+import inspect
 import os
 import re
 import tempfile
@@ -57,8 +58,10 @@ from qwen_tts import Qwen3TTSModel
 # ----------------------------
 # Configuration
 # ----------------------------
-MODEL_ID = os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+MODEL_ID = os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA not available, refusing CPU fallback")
+DEVICE = "cuda:0"
 
 # GTX 1080 stability: default to fp32 on CUDA; allow override if you upgrade GPU.
 FORCE_FP32 = os.environ.get("QWEN_FORCE_FP32", "1").strip() in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
@@ -82,6 +85,15 @@ DEFAULT_INSTRUCT = os.environ.get(
     "Read the text clearly, naturally, and conversationally.",
 ).strip()
 
+TRAIN_WAV_PATH = os.environ.get("QWEN_TRAIN_WAV", "train.wav").strip()
+TRAIN_TXT_PATH = os.environ.get("QWEN_TRAIN_TXT", "train.txt").strip()
+ALLOW_SPEAKER_WITH_TRAIN = os.environ.get("QWEN_ALLOW_SPEAKER_WITH_TRAIN", "0").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+FORCE_CUSTOM_SPEAKER = os.environ.get("QWEN_FORCE_CUSTOM_SPEAKER", "custom").strip()
+PROMPT_AUDIO_ARG_OVERRIDE = os.environ.get("QWEN_PROMPT_AUDIO_ARG", "").strip()
+PROMPT_TEXT_ARG_OVERRIDE = os.environ.get("QWEN_PROMPT_TEXT_ARG", "").strip()
+
 # Generation kwargs (best effort; still force greedy via generation_config)
 GEN_KWARGS = {
     "do_sample": False,
@@ -100,6 +112,10 @@ class SpeakReq(BaseModel):
     speaker: Optional[str] = None
     language: Optional[str] = None
     instruct: Optional[str] = None
+
+
+def status(step: str):
+    print(f"{PRINT_PREFIX} {step}", flush=True)
 
 
 def force_greedy(obj, label: str):
@@ -121,8 +137,227 @@ def force_greedy(obj, label: str):
         print(f"{PRINT_PREFIX} could not force greedy on {label}: {e}")
 
 
-print(f"{PRINT_PREFIX} loading {MODEL_ID} on {DEVICE} dtype={DTYPE}")
+status(f"startup: loading model={MODEL_ID} device={DEVICE} dtype={DTYPE}")
 model = Qwen3TTSModel.from_pretrained(MODEL_ID, device_map=DEVICE, dtype=DTYPE)
+status("startup: model loaded")
+
+
+def _device_from_module(maybe_module) -> Optional[str]:
+    if maybe_module is None:
+        return None
+    dev = getattr(maybe_module, "device", None)
+    if dev is not None:
+        return str(dev)
+    try:
+        param = next(maybe_module.parameters())
+        return str(param.device)
+    except Exception:
+        return None
+
+
+def _ensure_model_cuda() -> str:
+    """Fail fast if model is not actually placed on CUDA."""
+    candidates = [
+        getattr(model, "model", None),
+        getattr(model, "talker", None),
+        getattr(model, "code_predictor", None),
+        model,
+    ]
+    for candidate in candidates:
+        dev = _device_from_module(candidate)
+        if dev:
+            if not dev.startswith("cuda"):
+                raise RuntimeError(f"Model loaded on {dev}, refusing non-CUDA inference")
+            return dev
+    raise RuntimeError("Unable to determine model device, refusing to continue")
+
+
+MODEL_DEVICE = _ensure_model_cuda()
+status(f"startup: model runtime device confirmed={MODEL_DEVICE}")
+
+_GEN_CUSTOM_VOICE_PARAMS = set(inspect.signature(model.generate_custom_voice).parameters)
+_GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW = any(
+    p.kind == inspect.Parameter.VAR_KEYWORD
+    for p in inspect.signature(model.generate_custom_voice).parameters.values()
+)
+_GEN_CUSTOM_VOICE_REQUIRED_PARAMS = {
+    name
+    for name, p in inspect.signature(model.generate_custom_voice).parameters.items()
+    if p.default is inspect.Parameter.empty and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+}
+
+_HAS_GEN_VOICE_CLONE = hasattr(model, "generate_voice_clone")
+if _HAS_GEN_VOICE_CLONE:
+    _GEN_VOICE_CLONE_PARAMS = set(inspect.signature(model.generate_voice_clone).parameters)
+    _GEN_VOICE_CLONE_ACCEPTS_VAR_KW = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in inspect.signature(model.generate_voice_clone).parameters.values()
+    )
+else:
+    _GEN_VOICE_CLONE_PARAMS = set()
+    _GEN_VOICE_CLONE_ACCEPTS_VAR_KW = False
+
+
+def _resolve_training_paths() -> tuple[str, str]:
+    """Resolve train.wav / train.txt using cwd + script directory fallback."""
+    txt_candidates = [TRAIN_TXT_PATH]
+    # Backward compatibility for earlier typo-based default.
+    if TRAIN_TXT_PATH == "train.txt":
+        txt_candidates.append("tran.txt")
+
+    script_dir = os.path.dirname(__file__)
+    candidates = []
+    for txt_name in txt_candidates:
+        candidates.append((TRAIN_WAV_PATH, txt_name))
+        candidates.append((os.path.join(script_dir, TRAIN_WAV_PATH), os.path.join(script_dir, txt_name)))
+    for wav_path, txt_path in candidates:
+        if os.path.isfile(wav_path) and os.path.isfile(txt_path):
+            return wav_path, txt_path
+
+    raise FileNotFoundError(
+        f"Could not find startup training files. Looked for wav='{TRAIN_WAV_PATH}' and txt in {txt_candidates} "
+        f"in cwd and script directory."
+    )
+
+
+def _build_training_voice_kwargs() -> dict:
+    """Load startup voice snippet and map it into supported qwen-tts kwargs."""
+    status("startup: loading voice clone prompt files")
+    wav_path, txt_path = _resolve_training_paths()
+
+    with open(txt_path, "r", encoding="utf-8") as f:
+        transcript = f.read().strip()
+    if not transcript:
+        raise RuntimeError(f"Training text file is empty: {txt_path}")
+
+    kwargs: dict = {}
+
+    audio_arg_candidates = [
+        "prompt_audio",
+        "prompt_audio_path",
+        "audio_prompt_path",
+        "voice_prompt_path",
+        "voice",
+        "prompt_wav",
+        "prompt_wav_path",
+        "reference_audio",
+        "reference_audio_path",
+        "ref_audio",
+        "ref_audio_path",
+        "clone_audio",
+        "clone_audio_path",
+        "enroll_audio",
+        "enroll_audio_path",
+    ]
+    text_arg_candidates = [
+        "prompt_text",
+        "audio_prompt_text",
+        "voice_prompt_text",
+        "prompt_transcript",
+        "transcript",
+        "reference_text",
+        "ref_text",
+        "clone_text",
+        "enroll_text",
+    ]
+
+    if _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW:
+        # For wrapper APIs that accept **kwargs, keep prompt keys minimal to avoid ambiguous collisions.
+        chosen_audio_key = PROMPT_AUDIO_ARG_OVERRIDE or audio_arg_candidates[0]
+        chosen_text_key = PROMPT_TEXT_ARG_OVERRIDE or text_arg_candidates[0]
+        kwargs[chosen_audio_key] = wav_path
+        kwargs[chosen_text_key] = transcript
+        kwargs["voice_prompt"] = {"audio": wav_path, "text": transcript}
+    else:
+        if PROMPT_AUDIO_ARG_OVERRIDE:
+            if PROMPT_AUDIO_ARG_OVERRIDE in _GEN_CUSTOM_VOICE_PARAMS:
+                kwargs[PROMPT_AUDIO_ARG_OVERRIDE] = wav_path
+            else:
+                status(
+                    f"startup: ignored QWEN_PROMPT_AUDIO_ARG={PROMPT_AUDIO_ARG_OVERRIDE} (not in supported params)"
+                )
+        for key in audio_arg_candidates:
+            if kwargs:
+                break
+            if key in _GEN_CUSTOM_VOICE_PARAMS:
+                kwargs[key] = wav_path
+                break
+
+        if PROMPT_TEXT_ARG_OVERRIDE:
+            if PROMPT_TEXT_ARG_OVERRIDE in _GEN_CUSTOM_VOICE_PARAMS:
+                kwargs[PROMPT_TEXT_ARG_OVERRIDE] = transcript
+            else:
+                status(
+                    f"startup: ignored QWEN_PROMPT_TEXT_ARG={PROMPT_TEXT_ARG_OVERRIDE} (not in supported params)"
+                )
+        for key in text_arg_candidates:
+            if any(k in kwargs for k in text_arg_candidates + [PROMPT_TEXT_ARG_OVERRIDE]):
+                break
+            if key in _GEN_CUSTOM_VOICE_PARAMS:
+                kwargs[key] = transcript
+                break
+
+    # Some APIs use a structured prompt object instead of separate fields.
+    structured_prompt_candidates = ["voice_prompt", "prompt", "reference"]
+    if not kwargs and not _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW:
+        for key in structured_prompt_candidates:
+            if key in _GEN_CUSTOM_VOICE_PARAMS:
+                kwargs[key] = {"audio": wav_path, "text": transcript}
+                break
+    elif _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW:
+        kwargs["voice_prompt"] = {"audio": wav_path, "text": transcript}
+
+    if not kwargs:
+        status(
+            "startup: no compatible voice prompt args detected; "
+            f"available={sorted(_GEN_CUSTOM_VOICE_PARAMS)}"
+        )
+    else:
+        status(
+            f"startup: voice cloning prompt ready wav={wav_path} txt={txt_path} keys={sorted(kwargs.keys())}"
+        )
+        if _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW:
+            status("startup: generate_custom_voice accepts **kwargs; sending minimal prompt key set")
+
+    return kwargs
+
+
+def _build_voice_clone_kwargs() -> dict:
+    """Load startup voice snippet and map into generate_voice_clone kwargs."""
+    if not _HAS_GEN_VOICE_CLONE:
+        return {}
+
+    wav_path, txt_path = _resolve_training_paths()
+    with open(txt_path, "r", encoding="utf-8") as f:
+        transcript = f.read().strip()
+    if not transcript:
+        raise RuntimeError(f"Training text file is empty: {txt_path}")
+
+    kwargs = {}
+    if _GEN_VOICE_CLONE_ACCEPTS_VAR_KW or "ref_audio" in _GEN_VOICE_CLONE_PARAMS:
+        kwargs["ref_audio"] = wav_path
+    elif "reference_audio" in _GEN_VOICE_CLONE_PARAMS:
+        kwargs["reference_audio"] = wav_path
+
+    if _GEN_VOICE_CLONE_ACCEPTS_VAR_KW or "ref_text" in _GEN_VOICE_CLONE_PARAMS:
+        kwargs["ref_text"] = transcript
+    elif "reference_text" in _GEN_VOICE_CLONE_PARAMS:
+        kwargs["reference_text"] = transcript
+
+    if kwargs:
+        status(
+            f"startup: voice cloning reference ready wav={wav_path} txt={txt_path} keys={sorted(kwargs.keys())}"
+        )
+    else:
+        status(
+            "startup: generate_voice_clone present but no compatible ref kwargs detected; "
+            f"available={sorted(_GEN_VOICE_CLONE_PARAMS)}"
+        )
+    return kwargs
+
+
+TRAINING_VOICE_KWARGS = _build_training_voice_kwargs()
+VOICE_CLONE_KWARGS = _build_voice_clone_kwargs()
 
 # Force greedy decoding on internal components (critical for stability)
 try:
@@ -143,6 +378,10 @@ try:
     SUPPORTED_SPEAKERS = [x.strip().lower() for x in model.get_supported_speakers()]
 except Exception:
     SUPPORTED_SPEAKERS = []
+
+status(
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'}"
+)
 
 
 @app.get("/health")
@@ -232,27 +471,128 @@ def _chunk_text(text: str, max_chars: int = 240) -> list[str]:
     return merged
 
 
+_NUM_0_TO_19 = [
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+]
+_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+
+def _int_to_words(num: int) -> str:
+    if num < 20:
+        return _NUM_0_TO_19[num]
+    if num < 100:
+        tens = _TENS[num // 10]
+        rem = num % 10
+        return tens if rem == 0 else f"{tens} {_NUM_0_TO_19[rem]}"
+    if num < 1000:
+        hundreds = _NUM_0_TO_19[num // 100]
+        rem = num % 100
+        return f"{hundreds} hundred" if rem == 0 else f"{hundreds} hundred {_int_to_words(rem)}"
+    if num < 1_000_000:
+        thousands = _int_to_words(num // 1000)
+        rem = num % 1000
+        return f"{thousands} thousand" if rem == 0 else f"{thousands} thousand {_int_to_words(rem)}"
+    millions = _int_to_words(num // 1_000_000)
+    rem = num % 1_000_000
+    return f"{millions} million" if rem == 0 else f"{millions} million {_int_to_words(rem)}"
+
+
+def _normalize_text_for_tts(text: str) -> str:
+    """Convert integer digits to words and remove symbols before synthesis."""
+    def _replace_number(match: re.Match) -> str:
+        raw = match.group(0)
+        try:
+            return _int_to_words(int(raw))
+        except Exception:
+            return raw
+
+    normalized = re.sub(r"\d+", _replace_number, text)
+    # Keep letters/numbers/whitespace and sentence punctuation used by chunking.
+    normalized = re.sub(r"[^A-Za-z0-9\s\.!\?]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
 def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: str) -> Tuple[bytes, int]:
+    current_dev = _ensure_model_cuda()
+    status(f"speak: cloning voice (len={len(text)} chars, speaker={speaker}, language={language})")
+    status(f"speak: runtime model device={current_dev}")
+
+    use_voice_clone_api = bool(VOICE_CLONE_KWARGS) and _HAS_GEN_VOICE_CLONE
+    if use_voice_clone_api:
+        clone_kwargs = {
+            "text": text,
+            "language": language,
+            **VOICE_CLONE_KWARGS,
+            **GEN_KWARGS,
+        }
+        if not _GEN_VOICE_CLONE_ACCEPTS_VAR_KW:
+            clone_kwargs = {k: v for k, v in clone_kwargs.items() if k in _GEN_VOICE_CLONE_PARAMS}
+
+        sent_ref_keys = [k for k in clone_kwargs if k in VOICE_CLONE_KWARGS]
+        status(f"speak: using generate_voice_clone ref args={sorted(sent_ref_keys)}")
+
+        with torch.inference_mode():
+            if DEVICE.startswith("cuda") and AUTOMIX_FP32 and DTYPE == torch.float16:
+                with torch.autocast(device_type="cuda", dtype=torch.float32, enabled=True):
+                    audio_list, sr = model.generate_voice_clone(**clone_kwargs)
+            else:
+                audio_list, sr = model.generate_voice_clone(**clone_kwargs)
+
+        wav = _concat_audio(audio_list)
+        if wav.size == 0:
+            raise RuntimeError("Empty audio output from model")
+
+        buf = io.BytesIO()
+        sf.write(buf, wav, int(sr), format="WAV")
+        status(f"speak: cloning voice finished sr={int(sr)} samples={wav.size}")
+        return buf.getvalue(), int(sr)
+
+    call_kwargs = {
+        "text": text,
+        "language": language,
+        "instruct": instruct,
+        "non_streaming_mode": True,
+        **TRAINING_VOICE_KWARGS,
+        **GEN_KWARGS,
+    }
+
+    # When using a startup voice prompt, most qwen-tts variants should avoid a fixed built-in speaker.
+    if TRAINING_VOICE_KWARGS and not ALLOW_SPEAKER_WITH_TRAIN:
+        if "speaker" in _GEN_CUSTOM_VOICE_PARAMS and FORCE_CUSTOM_SPEAKER:
+            if SUPPORTED_SPEAKERS and FORCE_CUSTOM_SPEAKER.lower() not in SUPPORTED_SPEAKERS:
+                fallback_speaker = speaker or DEFAULT_SPEAKER
+                call_kwargs["speaker"] = fallback_speaker
+                status(
+                    "speak: custom speaker override skipped because it is not in model supported speakers; "
+                    f"using fallback speaker={fallback_speaker} with voice prompt"
+                )
+            else:
+                call_kwargs["speaker"] = FORCE_CUSTOM_SPEAKER
+                status(f"speak: using cloned voice speaker override speaker={FORCE_CUSTOM_SPEAKER}")
+    else:
+        call_kwargs["speaker"] = speaker
+
+    # Some qwen-tts builds require speaker even for prompt-based cloning.
+    if "speaker" in _GEN_CUSTOM_VOICE_REQUIRED_PARAMS and not call_kwargs.get("speaker"):
+        fallback_speaker = speaker or DEFAULT_SPEAKER
+        call_kwargs["speaker"] = fallback_speaker
+        status(f"speak: required speaker arg injected speaker={fallback_speaker}")
+
+    # Only pass arguments supported by the installed API signature, unless it accepts **kwargs.
+    if not _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW:
+        call_kwargs = {k: v for k, v in call_kwargs.items() if k in _GEN_CUSTOM_VOICE_PARAMS}
+
+    prompt_keys_sent = [k for k in call_kwargs if k in TRAINING_VOICE_KWARGS]
+    status(f"speak: voice prompt args in call={sorted(prompt_keys_sent)}")
+
     with torch.inference_mode():
         if DEVICE.startswith("cuda") and AUTOMIX_FP32 and DTYPE == torch.float16:
             with torch.autocast(device_type="cuda", dtype=torch.float32, enabled=True):
-                audio_list, sr = model.generate_custom_voice(
-                    text=text,
-                    speaker=speaker,
-                    language=language,
-                    instruct=instruct,
-                    non_streaming_mode=True,
-                    **GEN_KWARGS,
-                )
+                audio_list, sr = model.generate_custom_voice(**call_kwargs)
         else:
-            audio_list, sr = model.generate_custom_voice(
-                text=text,
-                speaker=speaker,
-                language=language,
-                instruct=instruct,
-                non_streaming_mode=True,
-                **GEN_KWARGS,
-            )
+            audio_list, sr = model.generate_custom_voice(**call_kwargs)
 
     wav = _concat_audio(audio_list)
     if wav.size == 0:
@@ -260,6 +600,7 @@ def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: s
 
     buf = io.BytesIO()
     sf.write(buf, wav, int(sr), format="WAV")
+    status(f"speak: cloning voice finished sr={int(sr)} samples={wav.size}")
     return buf.getvalue(), int(sr)
 
 
@@ -301,7 +642,9 @@ def _worker_loop():
         except queue.Empty:
             continue
         try:
+            status(f"playback: starting job={job.job_id}")
             _play_wav_bytes(job.wav_bytes)
+            status(f"playback: finished job={job.job_id}")
         finally:
             play_q.task_done()
 
@@ -327,8 +670,9 @@ def speak(
     max_chars: int = Query(240, ge=80, le=800, description="Chunk size cap"),
 ):
     request_start = time.perf_counter()
+    status("speak: request received")
 
-    text = (req.text or "").strip()
+    text = _normalize_text_for_tts((req.text or "").strip())
     if not text:
         return Response(status_code=204)
 
@@ -342,6 +686,7 @@ def speak(
         raise HTTPException(status_code=400, detail=f"Unsupported language '{language}'. Use GET /languages")
 
     parts = _chunk_text(text, max_chars=max_chars) if chunk else [text]
+    status(f"speak: chunking complete chunks={len(parts)} chunking={'on' if chunk else 'off'}")
     if not parts:
         return Response(status_code=204)
 
@@ -351,6 +696,7 @@ def speak(
 
     try:
         for idx, part in enumerate(parts):
+            status(f"speak: processing chunk {idx + 1}/{len(parts)}")
             wav_bytes, sr = _synthesize_to_wav_bytes(part, speaker, language, instruct)
             jid = f"{os.getpid()}-{threading.get_ident()}-{idx}"
             job_ids.append(jid)
@@ -358,6 +704,7 @@ def speak(
             if play:
                 try:
                     play_q.put_nowait(SpeakJob(wav_bytes=wav_bytes, job_id=jid))
+                    status(f"speak: queued playback job={jid} depth={play_q.qsize()}")
                 except queue.Full:
                     raise HTTPException(status_code=429, detail="Playback queue is full")
 
@@ -372,7 +719,7 @@ def speak(
 
     elapsed_seconds = time.perf_counter() - request_start
     completion_message = f"Request complete in {elapsed_seconds:.3f}s: {text}"
-    print(f"{PRINT_PREFIX} {completion_message}", flush=True)
+    status(completion_message)
 
     if return_audio and first_wav is not None:
         return Response(
