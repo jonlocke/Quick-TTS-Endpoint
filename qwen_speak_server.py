@@ -141,6 +141,40 @@ status(f"startup: loading model={MODEL_ID} device={DEVICE} dtype={DTYPE}")
 model = Qwen3TTSModel.from_pretrained(MODEL_ID, device_map=DEVICE, dtype=DTYPE)
 status("startup: model loaded")
 
+
+def _device_from_module(maybe_module) -> Optional[str]:
+    if maybe_module is None:
+        return None
+    dev = getattr(maybe_module, "device", None)
+    if dev is not None:
+        return str(dev)
+    try:
+        param = next(maybe_module.parameters())
+        return str(param.device)
+    except Exception:
+        return None
+
+
+def _ensure_model_cuda() -> str:
+    """Fail fast if model is not actually placed on CUDA."""
+    candidates = [
+        getattr(model, "model", None),
+        getattr(model, "talker", None),
+        getattr(model, "code_predictor", None),
+        model,
+    ]
+    for candidate in candidates:
+        dev = _device_from_module(candidate)
+        if dev:
+            if not dev.startswith("cuda"):
+                raise RuntimeError(f"Model loaded on {dev}, refusing non-CUDA inference")
+            return dev
+    raise RuntimeError("Unable to determine model device, refusing to continue")
+
+
+MODEL_DEVICE = _ensure_model_cuda()
+status(f"startup: model runtime device confirmed={MODEL_DEVICE}")
+
 _GEN_CUSTOM_VOICE_PARAMS = set(inspect.signature(model.generate_custom_voice).parameters)
 _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW = any(
     p.kind == inspect.Parameter.VAR_KEYWORD
@@ -438,7 +472,9 @@ def _chunk_text(text: str, max_chars: int = 240) -> list[str]:
 
 
 def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: str) -> Tuple[bytes, int]:
+    current_dev = _ensure_model_cuda()
     status(f"speak: cloning voice (len={len(text)} chars, speaker={speaker}, language={language})")
+    status(f"speak: runtime model device={current_dev}")
 
     use_voice_clone_api = bool(VOICE_CLONE_KWARGS) and _HAS_GEN_VOICE_CLONE
     if use_voice_clone_api:

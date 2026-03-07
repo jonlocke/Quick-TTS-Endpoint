@@ -35,3 +35,6 @@ For `Qwen/Qwen3-TTS-12Hz-0.6B-Base`, the server now prefers the model's
 `generate_voice_clone(...)` API when available, and passes the startup snippet as
 reference inputs (`ref_audio`/`ref_text` when supported). If unavailable, it
 falls back to `generate_custom_voice(...)` compatibility logic.
+
+
+If you are benchmarking GPU inference, call `/speak` with `play=false` to avoid ffplay server-side playback CPU overhead.
