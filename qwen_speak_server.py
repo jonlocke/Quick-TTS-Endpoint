@@ -150,6 +150,17 @@ _GEN_CUSTOM_VOICE_REQUIRED_PARAMS = {
     if p.default is inspect.Parameter.empty and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
 }
 
+_HAS_GEN_VOICE_CLONE = hasattr(model, "generate_voice_clone")
+if _HAS_GEN_VOICE_CLONE:
+    _GEN_VOICE_CLONE_PARAMS = set(inspect.signature(model.generate_voice_clone).parameters)
+    _GEN_VOICE_CLONE_ACCEPTS_VAR_KW = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in inspect.signature(model.generate_voice_clone).parameters.values()
+    )
+else:
+    _GEN_VOICE_CLONE_PARAMS = set()
+    _GEN_VOICE_CLONE_ACCEPTS_VAR_KW = False
+
 
 def _resolve_training_paths() -> tuple[str, str]:
     """Resolve train.wav / train.txt using cwd + script directory fallback."""
@@ -275,7 +286,42 @@ def _build_training_voice_kwargs() -> dict:
     return kwargs
 
 
+def _build_voice_clone_kwargs() -> dict:
+    """Load startup voice snippet and map into generate_voice_clone kwargs."""
+    if not _HAS_GEN_VOICE_CLONE:
+        return {}
+
+    wav_path, txt_path = _resolve_training_paths()
+    with open(txt_path, "r", encoding="utf-8") as f:
+        transcript = f.read().strip()
+    if not transcript:
+        raise RuntimeError(f"Training text file is empty: {txt_path}")
+
+    kwargs = {}
+    if _GEN_VOICE_CLONE_ACCEPTS_VAR_KW or "ref_audio" in _GEN_VOICE_CLONE_PARAMS:
+        kwargs["ref_audio"] = wav_path
+    elif "reference_audio" in _GEN_VOICE_CLONE_PARAMS:
+        kwargs["reference_audio"] = wav_path
+
+    if _GEN_VOICE_CLONE_ACCEPTS_VAR_KW or "ref_text" in _GEN_VOICE_CLONE_PARAMS:
+        kwargs["ref_text"] = transcript
+    elif "reference_text" in _GEN_VOICE_CLONE_PARAMS:
+        kwargs["reference_text"] = transcript
+
+    if kwargs:
+        status(
+            f"startup: voice cloning reference ready wav={wav_path} txt={txt_path} keys={sorted(kwargs.keys())}"
+        )
+    else:
+        status(
+            "startup: generate_voice_clone present but no compatible ref kwargs detected; "
+            f"available={sorted(_GEN_VOICE_CLONE_PARAMS)}"
+        )
+    return kwargs
+
+
 TRAINING_VOICE_KWARGS = _build_training_voice_kwargs()
+VOICE_CLONE_KWARGS = _build_voice_clone_kwargs()
 
 # Force greedy decoding on internal components (critical for stability)
 try:
@@ -298,7 +344,7 @@ except Exception:
     SUPPORTED_SPEAKERS = []
 
 status(
-    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'}"
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'}"
 )
 
 
@@ -391,6 +437,36 @@ def _chunk_text(text: str, max_chars: int = 240) -> list[str]:
 
 def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: str) -> Tuple[bytes, int]:
     status(f"speak: cloning voice (len={len(text)} chars, speaker={speaker}, language={language})")
+
+    use_voice_clone_api = bool(VOICE_CLONE_KWARGS) and _HAS_GEN_VOICE_CLONE
+    if use_voice_clone_api:
+        clone_kwargs = {
+            "text": text,
+            "language": language,
+            **VOICE_CLONE_KWARGS,
+            **GEN_KWARGS,
+        }
+        if not _GEN_VOICE_CLONE_ACCEPTS_VAR_KW:
+            clone_kwargs = {k: v for k, v in clone_kwargs.items() if k in _GEN_VOICE_CLONE_PARAMS}
+
+        sent_ref_keys = [k for k in clone_kwargs if k in VOICE_CLONE_KWARGS]
+        status(f"speak: using generate_voice_clone ref args={sorted(sent_ref_keys)}")
+
+        with torch.inference_mode():
+            if DEVICE.startswith("cuda") and AUTOMIX_FP32 and DTYPE == torch.float16:
+                with torch.autocast(device_type="cuda", dtype=torch.float32, enabled=True):
+                    audio_list, sr = model.generate_voice_clone(**clone_kwargs)
+            else:
+                audio_list, sr = model.generate_voice_clone(**clone_kwargs)
+
+        wav = _concat_audio(audio_list)
+        if wav.size == 0:
+            raise RuntimeError("Empty audio output from model")
+
+        buf = io.BytesIO()
+        sf.write(buf, wav, int(sr), format="WAV")
+        status(f"speak: cloning voice finished sr={int(sr)} samples={wav.size}")
+        return buf.getvalue(), int(sr)
 
     call_kwargs = {
         "text": text,
