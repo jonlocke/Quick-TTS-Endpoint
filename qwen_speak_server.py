@@ -84,7 +84,7 @@ DEFAULT_INSTRUCT = os.environ.get(
 ).strip()
 
 TRAIN_WAV_PATH = os.environ.get("QWEN_TRAIN_WAV", "train.wav").strip()
-TRAIN_TXT_PATH = os.environ.get("QWEN_TRAIN_TXT", "tran.txt").strip()
+TRAIN_TXT_PATH = os.environ.get("QWEN_TRAIN_TXT", "train.txt").strip()
 ALLOW_SPEAKER_WITH_TRAIN = os.environ.get("QWEN_ALLOW_SPEAKER_WITH_TRAIN", "0").strip().lower() in (
     "1", "true", "yes", "on"
 )
@@ -152,20 +152,23 @@ _GEN_CUSTOM_VOICE_REQUIRED_PARAMS = {
 
 
 def _resolve_training_paths() -> tuple[str, str]:
-    """Resolve train.wav / tran.txt using cwd + script directory fallback."""
-    candidates = [
-        (TRAIN_WAV_PATH, TRAIN_TXT_PATH),
-        (
-            os.path.join(os.path.dirname(__file__), TRAIN_WAV_PATH),
-            os.path.join(os.path.dirname(__file__), TRAIN_TXT_PATH),
-        ),
-    ]
+    """Resolve train.wav / train.txt using cwd + script directory fallback."""
+    txt_candidates = [TRAIN_TXT_PATH]
+    # Backward compatibility for earlier typo-based default.
+    if TRAIN_TXT_PATH == "train.txt":
+        txt_candidates.append("tran.txt")
+
+    script_dir = os.path.dirname(__file__)
+    candidates = []
+    for txt_name in txt_candidates:
+        candidates.append((TRAIN_WAV_PATH, txt_name))
+        candidates.append((os.path.join(script_dir, TRAIN_WAV_PATH), os.path.join(script_dir, txt_name)))
     for wav_path, txt_path in candidates:
         if os.path.isfile(wav_path) and os.path.isfile(txt_path):
             return wav_path, txt_path
 
     raise FileNotFoundError(
-        f"Could not find startup training files. Looked for wav='{TRAIN_WAV_PATH}' and txt='{TRAIN_TXT_PATH}' "
+        f"Could not find startup training files. Looked for wav='{TRAIN_WAV_PATH}' and txt in {txt_candidates} "
         f"in cwd and script directory."
     )
 

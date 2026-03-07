@@ -9,7 +9,7 @@ On startup, the server now attempts to load a training voice snippet and transcr
 then applies those prompt values to each `generate_custom_voice` call:
 
 - `train.wav`
-- `tran.txt`
+- `train.txt` (also accepts legacy `tran.txt` automatically)
 
 By default these are resolved from either:
 
