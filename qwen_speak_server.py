@@ -89,6 +89,8 @@ ALLOW_SPEAKER_WITH_TRAIN = os.environ.get("QWEN_ALLOW_SPEAKER_WITH_TRAIN", "0").
     "1", "true", "yes", "on"
 )
 FORCE_CUSTOM_SPEAKER = os.environ.get("QWEN_FORCE_CUSTOM_SPEAKER", "custom").strip()
+PROMPT_AUDIO_ARG_OVERRIDE = os.environ.get("QWEN_PROMPT_AUDIO_ARG", "").strip()
+PROMPT_TEXT_ARG_OVERRIDE = os.environ.get("QWEN_PROMPT_TEXT_ARG", "").strip()
 
 # Generation kwargs (best effort; still force greedy via generation_config)
 GEN_KWARGS = {
@@ -210,18 +212,37 @@ def _build_training_voice_kwargs() -> dict:
     ]
 
     if _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW:
-        # If the API accepts **kwargs, provide broad aliases so wrappers can map them.
-        for key in audio_arg_candidates:
-            kwargs[key] = wav_path
-        for key in text_arg_candidates:
-            kwargs[key] = transcript
+        # For wrapper APIs that accept **kwargs, keep prompt keys minimal to avoid ambiguous collisions.
+        chosen_audio_key = PROMPT_AUDIO_ARG_OVERRIDE or audio_arg_candidates[0]
+        chosen_text_key = PROMPT_TEXT_ARG_OVERRIDE or text_arg_candidates[0]
+        kwargs[chosen_audio_key] = wav_path
+        kwargs[chosen_text_key] = transcript
+        kwargs["voice_prompt"] = {"audio": wav_path, "text": transcript}
     else:
+        if PROMPT_AUDIO_ARG_OVERRIDE:
+            if PROMPT_AUDIO_ARG_OVERRIDE in _GEN_CUSTOM_VOICE_PARAMS:
+                kwargs[PROMPT_AUDIO_ARG_OVERRIDE] = wav_path
+            else:
+                status(
+                    f"startup: ignored QWEN_PROMPT_AUDIO_ARG={PROMPT_AUDIO_ARG_OVERRIDE} (not in supported params)"
+                )
         for key in audio_arg_candidates:
+            if kwargs:
+                break
             if key in _GEN_CUSTOM_VOICE_PARAMS:
                 kwargs[key] = wav_path
                 break
 
+        if PROMPT_TEXT_ARG_OVERRIDE:
+            if PROMPT_TEXT_ARG_OVERRIDE in _GEN_CUSTOM_VOICE_PARAMS:
+                kwargs[PROMPT_TEXT_ARG_OVERRIDE] = transcript
+            else:
+                status(
+                    f"startup: ignored QWEN_PROMPT_TEXT_ARG={PROMPT_TEXT_ARG_OVERRIDE} (not in supported params)"
+                )
         for key in text_arg_candidates:
+            if any(k in kwargs for k in text_arg_candidates + [PROMPT_TEXT_ARG_OVERRIDE]):
+                break
             if key in _GEN_CUSTOM_VOICE_PARAMS:
                 kwargs[key] = transcript
                 break
@@ -246,7 +267,7 @@ def _build_training_voice_kwargs() -> dict:
             f"startup: voice cloning prompt ready wav={wav_path} txt={txt_path} keys={sorted(kwargs.keys())}"
         )
         if _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW:
-            status("startup: generate_custom_voice accepts **kwargs; sending full prompt alias set")
+            status("startup: generate_custom_voice accepts **kwargs; sending minimal prompt key set")
 
     return kwargs
 

@@ -24,3 +24,4 @@ instead of a fixed built-in speaker. Optional tuning:
 
 - `QWEN_ALLOW_SPEAKER_WITH_TRAIN=1` to keep passing request/default speaker
 - `QWEN_FORCE_CUSTOM_SPEAKER` (default: `custom`) for APIs that need an explicit custom speaker label
+- `QWEN_PROMPT_AUDIO_ARG` / `QWEN_PROMPT_TEXT_ARG` to force exact prompt arg names if your installed qwen-tts wrapper expects specific keys
