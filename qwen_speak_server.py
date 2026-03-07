@@ -142,6 +142,11 @@ _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW = any(
     p.kind == inspect.Parameter.VAR_KEYWORD
     for p in inspect.signature(model.generate_custom_voice).parameters.values()
 )
+_GEN_CUSTOM_VOICE_REQUIRED_PARAMS = {
+    name
+    for name, p in inspect.signature(model.generate_custom_voice).parameters.items()
+    if p.default is inspect.Parameter.empty and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+}
 
 
 def _resolve_training_paths() -> tuple[str, str]:
@@ -385,6 +390,12 @@ def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: s
                 status(f"speak: using cloned voice speaker override speaker={FORCE_CUSTOM_SPEAKER}")
     else:
         call_kwargs["speaker"] = speaker
+
+    # Some qwen-tts builds require speaker even for prompt-based cloning.
+    if "speaker" in _GEN_CUSTOM_VOICE_REQUIRED_PARAMS and not call_kwargs.get("speaker"):
+        fallback_speaker = speaker or DEFAULT_SPEAKER
+        call_kwargs["speaker"] = fallback_speaker
+        status(f"speak: required speaker arg injected speaker={fallback_speaker}")
 
     # Only pass arguments supported by the installed API signature, unless it accepts **kwargs.
     if not _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW:
