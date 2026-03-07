@@ -106,6 +106,10 @@ class SpeakReq(BaseModel):
     instruct: Optional[str] = None
 
 
+def status(step: str):
+    print(f"{PRINT_PREFIX} {step}", flush=True)
+
+
 def force_greedy(obj, label: str):
     """
     Best-effort: disable sampling on any HF model with a generation_config.
@@ -125,8 +129,9 @@ def force_greedy(obj, label: str):
         print(f"{PRINT_PREFIX} could not force greedy on {label}: {e}")
 
 
-print(f"{PRINT_PREFIX} loading {MODEL_ID} on {DEVICE} dtype={DTYPE}")
+status(f"startup: loading model={MODEL_ID} device={DEVICE} dtype={DTYPE}")
 model = Qwen3TTSModel.from_pretrained(MODEL_ID, device_map=DEVICE, dtype=DTYPE)
+status("startup: model loaded")
 
 _GEN_CUSTOM_VOICE_PARAMS = set(inspect.signature(model.generate_custom_voice).parameters)
 
@@ -152,6 +157,7 @@ def _resolve_training_paths() -> tuple[str, str]:
 
 def _build_training_voice_kwargs() -> dict:
     """Load startup voice snippet and map it into supported qwen-tts kwargs."""
+    status("startup: loading voice clone prompt files")
     wav_path, txt_path = _resolve_training_paths()
 
     with open(txt_path, "r", encoding="utf-8") as f:
@@ -177,14 +183,12 @@ def _build_training_voice_kwargs() -> dict:
         kwargs["voice_prompt_text"] = transcript
 
     if not kwargs:
-        print(
-            f"{PRINT_PREFIX} warning: model API does not expose recognized voice prompt args; "
-            "startup training snippet will not be applied"
+        status(
+            "warning: model API does not expose recognized voice prompt args; startup training snippet will not be applied"
         )
     else:
-        print(
-            f"{PRINT_PREFIX} loaded startup voice snippet wav={wav_path} txt={txt_path} "
-            f"(keys={sorted(kwargs.keys())})"
+        status(
+            f"startup: voice cloning prompt ready wav={wav_path} txt={txt_path} keys={sorted(kwargs.keys())}"
         )
 
     return kwargs
@@ -211,6 +215,10 @@ try:
     SUPPORTED_SPEAKERS = [x.strip().lower() for x in model.get_supported_speakers()]
 except Exception:
     SUPPORTED_SPEAKERS = []
+
+status(
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'}"
+)
 
 
 @app.get("/health")
@@ -301,6 +309,7 @@ def _chunk_text(text: str, max_chars: int = 240) -> list[str]:
 
 
 def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: str) -> Tuple[bytes, int]:
+    status(f"speak: cloning voice (len={len(text)} chars, speaker={speaker}, language={language})")
     with torch.inference_mode():
         if DEVICE.startswith("cuda") and AUTOMIX_FP32 and DTYPE == torch.float16:
             with torch.autocast(device_type="cuda", dtype=torch.float32, enabled=True):
@@ -330,6 +339,7 @@ def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: s
 
     buf = io.BytesIO()
     sf.write(buf, wav, int(sr), format="WAV")
+    status(f"speak: cloning voice finished sr={int(sr)} samples={wav.size}")
     return buf.getvalue(), int(sr)
 
 
@@ -371,7 +381,9 @@ def _worker_loop():
         except queue.Empty:
             continue
         try:
+            status(f"playback: starting job={job.job_id}")
             _play_wav_bytes(job.wav_bytes)
+            status(f"playback: finished job={job.job_id}")
         finally:
             play_q.task_done()
 
@@ -397,6 +409,7 @@ def speak(
     max_chars: int = Query(240, ge=80, le=800, description="Chunk size cap"),
 ):
     request_start = time.perf_counter()
+    status("speak: request received")
 
     text = (req.text or "").strip()
     if not text:
@@ -412,6 +425,7 @@ def speak(
         raise HTTPException(status_code=400, detail=f"Unsupported language '{language}'. Use GET /languages")
 
     parts = _chunk_text(text, max_chars=max_chars) if chunk else [text]
+    status(f"speak: chunking complete chunks={len(parts)} chunking={'on' if chunk else 'off'}")
     if not parts:
         return Response(status_code=204)
 
@@ -421,6 +435,7 @@ def speak(
 
     try:
         for idx, part in enumerate(parts):
+            status(f"speak: processing chunk {idx + 1}/{len(parts)}")
             wav_bytes, sr = _synthesize_to_wav_bytes(part, speaker, language, instruct)
             jid = f"{os.getpid()}-{threading.get_ident()}-{idx}"
             job_ids.append(jid)
@@ -428,6 +443,7 @@ def speak(
             if play:
                 try:
                     play_q.put_nowait(SpeakJob(wav_bytes=wav_bytes, job_id=jid))
+                    status(f"speak: queued playback job={jid} depth={play_q.qsize()}")
                 except queue.Full:
                     raise HTTPException(status_code=429, detail="Playback queue is full")
 
@@ -442,7 +458,7 @@ def speak(
 
     elapsed_seconds = time.perf_counter() - request_start
     completion_message = f"Request complete in {elapsed_seconds:.3f}s: {text}"
-    print(f"{PRINT_PREFIX} {completion_message}", flush=True)
+    status(completion_message)
 
     if return_audio and first_wav is not None:
         return Response(
