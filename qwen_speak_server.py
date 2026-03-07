@@ -381,9 +381,11 @@ def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: s
     if TRAINING_VOICE_KWARGS and not ALLOW_SPEAKER_WITH_TRAIN:
         if "speaker" in _GEN_CUSTOM_VOICE_PARAMS and FORCE_CUSTOM_SPEAKER:
             if SUPPORTED_SPEAKERS and FORCE_CUSTOM_SPEAKER.lower() not in SUPPORTED_SPEAKERS:
+                fallback_speaker = speaker or DEFAULT_SPEAKER
+                call_kwargs["speaker"] = fallback_speaker
                 status(
                     "speak: custom speaker override skipped because it is not in model supported speakers; "
-                    "sending voice prompt without speaker override"
+                    f"using fallback speaker={fallback_speaker} with voice prompt"
                 )
             else:
                 call_kwargs["speaker"] = FORCE_CUSTOM_SPEAKER
