@@ -59,7 +59,9 @@ from qwen_tts import Qwen3TTSModel
 # Configuration
 # ----------------------------
 MODEL_ID = os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+if not torch.cuda.is_available():
+    raise RuntimeError("CUDA not available, refusing CPU fallback")
+DEVICE = "cuda:0"
 
 # GTX 1080 stability: default to fp32 on CUDA; allow override if you upgrade GPU.
 FORCE_FP32 = os.environ.get("QWEN_FORCE_FP32", "1").strip() in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
