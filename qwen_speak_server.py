@@ -471,6 +471,49 @@ def _chunk_text(text: str, max_chars: int = 240) -> list[str]:
     return merged
 
 
+_NUM_0_TO_19 = [
+    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+]
+_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+
+
+def _int_to_words(num: int) -> str:
+    if num < 20:
+        return _NUM_0_TO_19[num]
+    if num < 100:
+        tens = _TENS[num // 10]
+        rem = num % 10
+        return tens if rem == 0 else f"{tens} {_NUM_0_TO_19[rem]}"
+    if num < 1000:
+        hundreds = _NUM_0_TO_19[num // 100]
+        rem = num % 100
+        return f"{hundreds} hundred" if rem == 0 else f"{hundreds} hundred {_int_to_words(rem)}"
+    if num < 1_000_000:
+        thousands = _int_to_words(num // 1000)
+        rem = num % 1000
+        return f"{thousands} thousand" if rem == 0 else f"{thousands} thousand {_int_to_words(rem)}"
+    millions = _int_to_words(num // 1_000_000)
+    rem = num % 1_000_000
+    return f"{millions} million" if rem == 0 else f"{millions} million {_int_to_words(rem)}"
+
+
+def _normalize_text_for_tts(text: str) -> str:
+    """Convert integer digits to words and remove symbols before synthesis."""
+    def _replace_number(match: re.Match) -> str:
+        raw = match.group(0)
+        try:
+            return _int_to_words(int(raw))
+        except Exception:
+            return raw
+
+    normalized = re.sub(r"\d+", _replace_number, text)
+    # Keep letters/numbers/whitespace and sentence punctuation used by chunking.
+    normalized = re.sub(r"[^A-Za-z0-9\s\.!\?]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
 def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: str) -> Tuple[bytes, int]:
     current_dev = _ensure_model_cuda()
     status(f"speak: cloning voice (len={len(text)} chars, speaker={speaker}, language={language})")
@@ -629,7 +672,7 @@ def speak(
     request_start = time.perf_counter()
     status("speak: request received")
 
-    text = (req.text or "").strip()
+    text = _normalize_text_for_tts((req.text or "").strip())
     if not text:
         return Response(status_code=204)
 

@@ -38,3 +38,6 @@ falls back to `generate_custom_voice(...)` compatibility logic.
 
 
 If you are benchmarking GPU inference, call `/speak` with `play=false` to avoid ffplay server-side playback CPU overhead.
+
+
+Input normalization: `/speak` now converts integer digits to words (e.g. `3` -> `three`) and strips non-speech symbols before synthesis.
