@@ -166,25 +166,58 @@ def _build_training_voice_kwargs() -> dict:
         raise RuntimeError(f"Training text file is empty: {txt_path}")
 
     kwargs: dict = {}
-    if "prompt_audio" in _GEN_CUSTOM_VOICE_PARAMS:
-        kwargs["prompt_audio"] = wav_path
-    elif "audio_prompt_path" in _GEN_CUSTOM_VOICE_PARAMS:
-        kwargs["audio_prompt_path"] = wav_path
-    elif "voice_prompt_path" in _GEN_CUSTOM_VOICE_PARAMS:
-        kwargs["voice_prompt_path"] = wav_path
-    elif "voice" in _GEN_CUSTOM_VOICE_PARAMS:
-        kwargs["voice"] = wav_path
 
-    if "prompt_text" in _GEN_CUSTOM_VOICE_PARAMS:
-        kwargs["prompt_text"] = transcript
-    elif "audio_prompt_text" in _GEN_CUSTOM_VOICE_PARAMS:
-        kwargs["audio_prompt_text"] = transcript
-    elif "voice_prompt_text" in _GEN_CUSTOM_VOICE_PARAMS:
-        kwargs["voice_prompt_text"] = transcript
+    audio_arg_candidates = [
+        "prompt_audio",
+        "prompt_audio_path",
+        "audio_prompt_path",
+        "voice_prompt_path",
+        "voice",
+        "prompt_wav",
+        "prompt_wav_path",
+        "reference_audio",
+        "reference_audio_path",
+        "ref_audio",
+        "ref_audio_path",
+        "clone_audio",
+        "clone_audio_path",
+        "enroll_audio",
+        "enroll_audio_path",
+    ]
+    text_arg_candidates = [
+        "prompt_text",
+        "audio_prompt_text",
+        "voice_prompt_text",
+        "prompt_transcript",
+        "transcript",
+        "reference_text",
+        "ref_text",
+        "clone_text",
+        "enroll_text",
+    ]
+
+    for key in audio_arg_candidates:
+        if key in _GEN_CUSTOM_VOICE_PARAMS:
+            kwargs[key] = wav_path
+            break
+
+    for key in text_arg_candidates:
+        if key in _GEN_CUSTOM_VOICE_PARAMS:
+            kwargs[key] = transcript
+            break
+
+    # Some APIs use a structured prompt object instead of separate fields.
+    structured_prompt_candidates = ["voice_prompt", "prompt", "reference"]
+    if not kwargs:
+        for key in structured_prompt_candidates:
+            if key in _GEN_CUSTOM_VOICE_PARAMS:
+                kwargs[key] = {"audio": wav_path, "text": transcript}
+                break
 
     if not kwargs:
         status(
-            "warning: model API does not expose recognized voice prompt args; startup training snippet will not be applied"
+            "startup: no compatible voice prompt args detected; "
+            f"available={sorted(_GEN_CUSTOM_VOICE_PARAMS)}"
         )
     else:
         status(
