@@ -375,8 +375,14 @@ def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: s
     # When using a startup voice prompt, most qwen-tts variants should avoid a fixed built-in speaker.
     if TRAINING_VOICE_KWARGS and not ALLOW_SPEAKER_WITH_TRAIN:
         if "speaker" in _GEN_CUSTOM_VOICE_PARAMS and FORCE_CUSTOM_SPEAKER:
-            call_kwargs["speaker"] = FORCE_CUSTOM_SPEAKER
-            status(f"speak: using cloned voice speaker override speaker={FORCE_CUSTOM_SPEAKER}")
+            if SUPPORTED_SPEAKERS and FORCE_CUSTOM_SPEAKER.lower() not in SUPPORTED_SPEAKERS:
+                status(
+                    "speak: custom speaker override skipped because it is not in model supported speakers; "
+                    "sending voice prompt without speaker override"
+                )
+            else:
+                call_kwargs["speaker"] = FORCE_CUSTOM_SPEAKER
+                status(f"speak: using cloned voice speaker override speaker={FORCE_CUSTOM_SPEAKER}")
     else:
         call_kwargs["speaker"] = speaker
 
