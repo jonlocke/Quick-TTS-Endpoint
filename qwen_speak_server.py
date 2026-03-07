@@ -85,6 +85,10 @@ DEFAULT_INSTRUCT = os.environ.get(
 
 TRAIN_WAV_PATH = os.environ.get("QWEN_TRAIN_WAV", "train.wav").strip()
 TRAIN_TXT_PATH = os.environ.get("QWEN_TRAIN_TXT", "tran.txt").strip()
+ALLOW_SPEAKER_WITH_TRAIN = os.environ.get("QWEN_ALLOW_SPEAKER_WITH_TRAIN", "0").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+FORCE_CUSTOM_SPEAKER = os.environ.get("QWEN_FORCE_CUSTOM_SPEAKER", "custom").strip()
 
 # Generation kwargs (best effort; still force greedy via generation_config)
 GEN_KWARGS = {
@@ -343,28 +347,33 @@ def _chunk_text(text: str, max_chars: int = 240) -> list[str]:
 
 def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: str) -> Tuple[bytes, int]:
     status(f"speak: cloning voice (len={len(text)} chars, speaker={speaker}, language={language})")
+
+    call_kwargs = {
+        "text": text,
+        "language": language,
+        "instruct": instruct,
+        "non_streaming_mode": True,
+        **TRAINING_VOICE_KWARGS,
+        **GEN_KWARGS,
+    }
+
+    # When using a startup voice prompt, most qwen-tts variants should avoid a fixed built-in speaker.
+    if TRAINING_VOICE_KWARGS and not ALLOW_SPEAKER_WITH_TRAIN:
+        if "speaker" in _GEN_CUSTOM_VOICE_PARAMS and FORCE_CUSTOM_SPEAKER:
+            call_kwargs["speaker"] = FORCE_CUSTOM_SPEAKER
+            status(f"speak: using cloned voice speaker override speaker={FORCE_CUSTOM_SPEAKER}")
+    else:
+        call_kwargs["speaker"] = speaker
+
+    # Only pass arguments supported by the installed API signature.
+    call_kwargs = {k: v for k, v in call_kwargs.items() if k in _GEN_CUSTOM_VOICE_PARAMS}
+
     with torch.inference_mode():
         if DEVICE.startswith("cuda") and AUTOMIX_FP32 and DTYPE == torch.float16:
             with torch.autocast(device_type="cuda", dtype=torch.float32, enabled=True):
-                audio_list, sr = model.generate_custom_voice(
-                    text=text,
-                    speaker=speaker,
-                    language=language,
-                    instruct=instruct,
-                    non_streaming_mode=True,
-                    **TRAINING_VOICE_KWARGS,
-                    **GEN_KWARGS,
-                )
+                audio_list, sr = model.generate_custom_voice(**call_kwargs)
         else:
-            audio_list, sr = model.generate_custom_voice(
-                text=text,
-                speaker=speaker,
-                language=language,
-                instruct=instruct,
-                non_streaming_mode=True,
-                **TRAINING_VOICE_KWARGS,
-                **GEN_KWARGS,
-            )
+            audio_list, sr = model.generate_custom_voice(**call_kwargs)
 
     wav = _concat_audio(audio_list)
     if wav.size == 0:

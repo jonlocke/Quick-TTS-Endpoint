@@ -18,3 +18,9 @@ You can override paths with:
 
 - `QWEN_TRAIN_WAV`
 - `QWEN_TRAIN_TXT`
+
+When training prompt files are present, the server defaults to clone-first behavior
+instead of a fixed built-in speaker. Optional tuning:
+
+- `QWEN_ALLOW_SPEAKER_WITH_TRAIN=1` to keep passing request/default speaker
+- `QWEN_FORCE_CUSTOM_SPEAKER` (default: `custom`) for APIs that need an explicit custom speaker label
