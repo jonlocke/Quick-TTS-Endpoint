@@ -138,6 +138,10 @@ model = Qwen3TTSModel.from_pretrained(MODEL_ID, device_map=DEVICE, dtype=DTYPE)
 status("startup: model loaded")
 
 _GEN_CUSTOM_VOICE_PARAMS = set(inspect.signature(model.generate_custom_voice).parameters)
+_GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW = any(
+    p.kind == inspect.Parameter.VAR_KEYWORD
+    for p in inspect.signature(model.generate_custom_voice).parameters.values()
+)
 
 
 def _resolve_training_paths() -> tuple[str, str]:
@@ -200,23 +204,32 @@ def _build_training_voice_kwargs() -> dict:
         "enroll_text",
     ]
 
-    for key in audio_arg_candidates:
-        if key in _GEN_CUSTOM_VOICE_PARAMS:
+    if _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW:
+        # If the API accepts **kwargs, provide broad aliases so wrappers can map them.
+        for key in audio_arg_candidates:
             kwargs[key] = wav_path
-            break
-
-    for key in text_arg_candidates:
-        if key in _GEN_CUSTOM_VOICE_PARAMS:
+        for key in text_arg_candidates:
             kwargs[key] = transcript
-            break
+    else:
+        for key in audio_arg_candidates:
+            if key in _GEN_CUSTOM_VOICE_PARAMS:
+                kwargs[key] = wav_path
+                break
+
+        for key in text_arg_candidates:
+            if key in _GEN_CUSTOM_VOICE_PARAMS:
+                kwargs[key] = transcript
+                break
 
     # Some APIs use a structured prompt object instead of separate fields.
     structured_prompt_candidates = ["voice_prompt", "prompt", "reference"]
-    if not kwargs:
+    if not kwargs and not _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW:
         for key in structured_prompt_candidates:
             if key in _GEN_CUSTOM_VOICE_PARAMS:
                 kwargs[key] = {"audio": wav_path, "text": transcript}
                 break
+    elif _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW:
+        kwargs["voice_prompt"] = {"audio": wav_path, "text": transcript}
 
     if not kwargs:
         status(
@@ -227,6 +240,8 @@ def _build_training_voice_kwargs() -> dict:
         status(
             f"startup: voice cloning prompt ready wav={wav_path} txt={txt_path} keys={sorted(kwargs.keys())}"
         )
+        if _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW:
+            status("startup: generate_custom_voice accepts **kwargs; sending full prompt alias set")
 
     return kwargs
 
@@ -365,8 +380,12 @@ def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: s
     else:
         call_kwargs["speaker"] = speaker
 
-    # Only pass arguments supported by the installed API signature.
-    call_kwargs = {k: v for k, v in call_kwargs.items() if k in _GEN_CUSTOM_VOICE_PARAMS}
+    # Only pass arguments supported by the installed API signature, unless it accepts **kwargs.
+    if not _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW:
+        call_kwargs = {k: v for k, v in call_kwargs.items() if k in _GEN_CUSTOM_VOICE_PARAMS}
+
+    prompt_keys_sent = [k for k in call_kwargs if k in TRAINING_VOICE_KWARGS]
+    status(f"speak: voice prompt args in call={sorted(prompt_keys_sent)}")
 
     with torch.inference_mode():
         if DEVICE.startswith("cuda") and AUTOMIX_FP32 and DTYPE == torch.float16:
