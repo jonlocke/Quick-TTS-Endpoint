@@ -22,6 +22,7 @@ Env overrides:
   QWEN_SPEAKER        default: ryan
   QWEN_LANG           default: english
   QWEN_INSTRUCT       default: "Read the text clearly, naturally, and conversationally."
+  QWEN_CUDA_DEVICE    default: auto (cuda index, cuda:N, or auto to pick best NVIDIA GPU)
   QWEN_DTYPE          default: auto (auto prefers bf16 on supported CUDA, otherwise follows legacy fp32/fp16 behavior)
   QWEN_AUTOMIX_FP32   default: 0  (legacy; only applies when running fp16)
   QWEN_FORCE_FP32     default: 1  (legacy fallback when QWEN_DTYPE=auto and bf16 unavailable)
@@ -85,14 +86,62 @@ def _resolve_model_id(raw_model_id: str) -> str:
 MODEL_ID = _resolve_model_id(RAW_MODEL_ID)
 if not torch.cuda.is_available():
     raise RuntimeError("CUDA not available, refusing CPU fallback")
-DEVICE = "cuda:0"
+
+REQUESTED_CUDA_DEVICE = os.environ.get("QWEN_CUDA_DEVICE", "auto").strip().lower()
+
+
+def _resolve_cuda_device() -> str:
+    count = torch.cuda.device_count()
+    if count <= 0:
+        raise RuntimeError("CUDA reports zero visible devices")
+
+    if REQUESTED_CUDA_DEVICE and REQUESTED_CUDA_DEVICE != "auto":
+        raw = REQUESTED_CUDA_DEVICE
+        if raw.startswith("cuda:"):
+            raw = raw.split(":", 1)[1]
+        try:
+            idx = int(raw)
+        except ValueError as e:
+            raise RuntimeError(f"Invalid QWEN_CUDA_DEVICE value '{REQUESTED_CUDA_DEVICE}'. Use auto, N, or cuda:N") from e
+        if idx < 0 or idx >= count:
+            raise RuntimeError(f"QWEN_CUDA_DEVICE index {idx} is out of range (visible CUDA devices: 0..{count - 1})")
+        return f"cuda:{idx}"
+
+    best_idx = 0
+    best_score = (-1, -1)
+    for idx in range(count):
+        props = torch.cuda.get_device_properties(idx)
+        name = (props.name or "").lower()
+        is_rtx = 1 if "rtx" in name else 0
+        score = (is_rtx, int(props.total_memory))
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+    return f"cuda:{best_idx}"
+
+
+DEVICE = _resolve_cuda_device()
+CUDA_DEVICE_INDEX = int(DEVICE.split(":", 1)[1])
+torch.cuda.set_device(CUDA_DEVICE_INDEX)
+CUDA_DEVICE_NAME = torch.cuda.get_device_name(CUDA_DEVICE_INDEX)
+
 
 # Legacy toggle retained for backward compatibility with existing env setups.
 FORCE_FP32 = os.environ.get("QWEN_FORCE_FP32", "1").strip() in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
 REQUESTED_DTYPE = os.environ.get("QWEN_DTYPE", "auto").strip().lower()
-CUDA_BF16_AVAILABLE = bool(
-    torch.cuda.is_available() and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
-)
+
+
+def _is_bf16_supported_for_device(device_index: int) -> bool:
+    if not hasattr(torch.cuda, "is_bf16_supported"):
+        return False
+    try:
+        return bool(torch.cuda.is_bf16_supported())
+    except TypeError:
+        # Older torch variants may not support a device argument and inspect current device only.
+        return bool(torch.cuda.is_bf16_supported())
+
+
+CUDA_BF16_AVAILABLE = _is_bf16_supported_for_device(CUDA_DEVICE_INDEX)
 
 
 def _resolve_requested_dtype() -> torch.dtype:
@@ -237,7 +286,7 @@ def force_greedy_recursive(root, label: str):
 
 if RAW_MODEL_ID.strip() and RAW_MODEL_ID.strip() != MODEL_ID:
     status(f"startup: remapped model alias '{RAW_MODEL_ID}' -> '{MODEL_ID}'")
-status(f"startup: loading model={MODEL_ID} device={DEVICE} dtype={_dtype_name(DTYPE)}")
+status(f"startup: loading model={MODEL_ID} device={DEVICE} device_name={CUDA_DEVICE_NAME} requested_cuda_device={REQUESTED_CUDA_DEVICE or "auto"} dtype={_dtype_name(DTYPE)}")
 try:
     model = Qwen3TTSModel.from_pretrained(MODEL_ID, device_map=DEVICE, dtype=DTYPE)
 except OSError as e:
@@ -511,7 +560,7 @@ except Exception:
     SUPPORTED_SPEAKERS = []
 
 status(
-    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} active_dtype={_dtype_name(DTYPE)} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} fp16_promote_bf16={'on' if FP16_PROMOTE_MODEL_BF16 else 'off'} remove_invalid_values={'on' if REMOVE_INVALID_VALUES else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f}"
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} active_dtype={_dtype_name(DTYPE)} device_name={CUDA_DEVICE_NAME} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} fp16_promote_bf16={'on' if FP16_PROMOTE_MODEL_BF16 else 'off'} remove_invalid_values={'on' if REMOVE_INVALID_VALUES else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f}"
 )
 
 
@@ -521,6 +570,7 @@ def health():
         "ok": True,
         "model": MODEL_ID,
         "device": DEVICE,
+        "device_name": CUDA_DEVICE_NAME,
         "dtype": _dtype_name(DTYPE),
         "requested_dtype": REQUESTED_DTYPE,
         "cuda_bf16_available": CUDA_BF16_AVAILABLE,
@@ -802,7 +852,7 @@ def _synthesize_to_audio(text: str, speaker: str, language: str, instruct: str) 
     is_cloned_voice = use_voice_clone_api or bool(TRAINING_VOICE_KWARGS)
     speaker_label = "cloned" if is_cloned_voice else speaker
     status(f"speak: cloning voice (len={len(text)} chars, speaker={speaker_label}, language={language})")
-    status(f"speak: runtime model device={current_dev} dtype={_dtype_name(DTYPE)} requested_dtype={REQUESTED_DTYPE} bf16_available={CUDA_BF16_AVAILABLE}")
+    status(f"speak: runtime model device={current_dev} dtype={_dtype_name(DTYPE)} requested_dtype={REQUESTED_DTYPE} bf16_available={CUDA_BF16_AVAILABLE} device_name={CUDA_DEVICE_NAME}")
 
     if use_voice_clone_api:
         clone_kwargs = {
