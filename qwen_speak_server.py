@@ -621,8 +621,8 @@ def _normalize_text_for_tts(text: str) -> str:
             return raw
 
     normalized = re.sub(r"\d+", _replace_number, text)
-    # Keep letters/numbers/whitespace and sentence punctuation used by chunking.
-    normalized = re.sub(r"[^A-Za-z0-9\s\.!\?]", " ", normalized)
+    # Keep letters/numbers/whitespace and sentence punctuation used by chunking (including commas).
+    normalized = re.sub(r"[^A-Za-z0-9\s,\.!\?]", " ", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return normalized
 
