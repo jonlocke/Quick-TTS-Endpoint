@@ -516,10 +516,12 @@ def _normalize_text_for_tts(text: str) -> str:
 
 def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: str) -> Tuple[bytes, int]:
     current_dev = _ensure_model_cuda()
-    status(f"speak: cloning voice (len={len(text)} chars, speaker={speaker}, language={language})")
+    use_voice_clone_api = bool(VOICE_CLONE_KWARGS) and _HAS_GEN_VOICE_CLONE
+    is_cloned_voice = use_voice_clone_api or bool(TRAINING_VOICE_KWARGS)
+    speaker_label = "cloned" if is_cloned_voice else speaker
+    status(f"speak: cloning voice (len={len(text)} chars, speaker={speaker_label}, language={language})")
     status(f"speak: runtime model device={current_dev}")
 
-    use_voice_clone_api = bool(VOICE_CLONE_KWARGS) and _HAS_GEN_VOICE_CLONE
     if use_voice_clone_api:
         clone_kwargs = {
             "text": text,
