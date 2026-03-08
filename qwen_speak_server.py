@@ -36,6 +36,7 @@ Deps (WSL):
 import io
 import concurrent.futures
 import inspect
+import gc
 import os
 import re
 import subprocess
@@ -76,6 +77,9 @@ else:
 # Optional: compute in fp32 while keeping fp16 weights (extra stability) - mostly irrelevant if DTYPE=fp32
 AUTOMIX_FP32 = os.environ.get("QWEN_AUTOMIX_FP32", "0").strip() in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
 FP16_RETRY_FP32 = os.environ.get("QWEN_FP16_RETRY_FP32", "1").strip() in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
+EMPTY_CACHE_EACH_CHUNK = os.environ.get("QWEN_CUDA_EMPTY_CACHE_EACH_CHUNK", "0").strip() in (
+    "1", "true", "TRUE", "yes", "YES", "on", "ON"
+)
 
 # Allow TF32 (helps newer GPUs; harmless on most)
 if torch.cuda.is_available():
@@ -634,6 +638,21 @@ def _synthesize_to_audio(text: str, speaker: str, language: str, instruct: str) 
     return wav, int(sr)
 
 
+def _maybe_compact_cuda_heap() -> None:
+    """
+    Optional mitigation for perceived per-chunk VRAM growth in nvidia-smi.
+
+    PyTorch keeps freed blocks in a caching allocator, which can look like memory
+    growth even when tensors are no longer live. This hook lets operators force a
+    cache release between chunks when desired.
+    """
+    if not (EMPTY_CACHE_EACH_CHUNK and torch.cuda.is_available()):
+        return
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def _encode_wav_bytes(wav: np.ndarray, sr: int) -> bytes:
     buf = io.BytesIO()
     sf.write(buf, wav, int(sr), format="WAV")
@@ -781,6 +800,7 @@ def speak(
                 wav, sr = _synthesize_to_audio(part, speaker, language, instruct)
             finally:
                 GPU_SYNTH_SEMAPHORE.release()
+                _maybe_compact_cuda_heap()
 
             if idx == 0 and first_chunk_latency_seconds is None:
                 # First-chunk proxy: when first synthesized chunk exits model inference.
