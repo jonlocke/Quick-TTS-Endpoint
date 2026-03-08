@@ -5,7 +5,7 @@ Qwen3-TTS local /speak server for AImaster (qwen-tts)
 - POST /speak {"text":"..."}  -> by default: queues playback (FIFO) and returns JSON
   Query params:
     play=1|0         (default 1)  queue server-side playback via ffplay
-    return_audio=1|0 (default 0)  return audio/wav bytes (first chunk) instead of JSON
+    return_audio=1|0 (default 0)  return audio/wav bytes (all chunks concatenated) instead of JSON
     chunk=1|0        (default 1)  split into sentence-ish chunks for earlier playback
     max_chars=N      (default 240) chunk size cap
 
@@ -516,10 +516,12 @@ def _normalize_text_for_tts(text: str) -> str:
 
 def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: str) -> Tuple[bytes, int]:
     current_dev = _ensure_model_cuda()
-    status(f"speak: cloning voice (len={len(text)} chars, speaker={speaker}, language={language})")
+    use_voice_clone_api = bool(VOICE_CLONE_KWARGS) and _HAS_GEN_VOICE_CLONE
+    is_cloned_voice = use_voice_clone_api or bool(TRAINING_VOICE_KWARGS)
+    speaker_label = "cloned" if is_cloned_voice else speaker
+    status(f"speak: cloning voice (len={len(text)} chars, speaker={speaker_label}, language={language})")
     status(f"speak: runtime model device={current_dev}")
 
-    use_voice_clone_api = bool(VOICE_CLONE_KWARGS) and _HAS_GEN_VOICE_CLONE
     if use_voice_clone_api:
         clone_kwargs = {
             "text": text,
@@ -604,6 +606,33 @@ def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: s
     return buf.getvalue(), int(sr)
 
 
+def _concat_wav_bytes(wav_chunks: list[bytes]) -> Tuple[bytes, int]:
+    """Concatenate several WAV payloads into one WAV payload."""
+    if not wav_chunks:
+        raise RuntimeError("No WAV chunks to concatenate")
+
+    merged_audio: list[np.ndarray] = []
+    sample_rate: Optional[int] = None
+
+    for chunk_bytes in wav_chunks:
+        with io.BytesIO(chunk_bytes) as chunk_buf:
+            chunk_audio, chunk_sr = sf.read(chunk_buf, dtype="float32")
+
+        if sample_rate is None:
+            sample_rate = int(chunk_sr)
+        elif int(chunk_sr) != sample_rate:
+            raise RuntimeError(
+                f"Sample-rate mismatch across chunks ({sample_rate} vs {int(chunk_sr)})"
+            )
+
+        merged_audio.append(np.asarray(chunk_audio).squeeze())
+
+    merged = _concat_audio(merged_audio)
+    out = io.BytesIO()
+    sf.write(out, merged, sample_rate, format="WAV")
+    return out.getvalue(), sample_rate
+
+
 # ----------------------------
 # Playback queue (FIFO; prevents overlap)
 # ----------------------------
@@ -665,7 +694,7 @@ def _shutdown():
 def speak(
     req: SpeakReq,
     play: bool = Query(True, description="If true (default), queue server-side playback via ffplay"),
-    return_audio: bool = Query(False, description="If true, return audio/wav bytes (first chunk) instead of JSON"),
+    return_audio: bool = Query(False, description="If true, return audio/wav bytes (all chunks) instead of JSON"),
     chunk: bool = Query(True, description="If true (default), split into sentence-ish chunks"),
     max_chars: int = Query(240, ge=80, le=800, description="Chunk size cap"),
 ):
@@ -691,13 +720,12 @@ def speak(
         return Response(status_code=204)
 
     job_ids = []
-    first_wav = None
-    first_sr = None
+    audio_chunks: list[bytes] = []
 
     try:
         for idx, part in enumerate(parts):
             status(f"speak: processing chunk {idx + 1}/{len(parts)}")
-            wav_bytes, sr = _synthesize_to_wav_bytes(part, speaker, language, instruct)
+            wav_bytes, _sr = _synthesize_to_wav_bytes(part, speaker, language, instruct)
             jid = f"{os.getpid()}-{threading.get_ident()}-{idx}"
             job_ids.append(jid)
 
@@ -708,8 +736,8 @@ def speak(
                 except queue.Full:
                     raise HTTPException(status_code=429, detail="Playback queue is full")
 
-            if return_audio and first_wav is None:
-                first_wav, first_sr = wav_bytes, sr
+            if return_audio:
+                audio_chunks.append(wav_bytes)
 
     except HTTPException:
         raise
@@ -721,15 +749,16 @@ def speak(
     completion_message = f"Request complete in {elapsed_seconds:.3f}s: {text}"
     status(completion_message)
 
-    if return_audio and first_wav is not None:
+    if return_audio and audio_chunks:
+        merged_wav, merged_sr = _concat_wav_bytes(audio_chunks)
         return Response(
-            content=first_wav,
+            content=merged_wav,
             media_type="audio/wav",
             headers={
                 "X-Qwen-Request-Status": "complete",
                 "X-Qwen-Speaker": speaker,
                 "X-Qwen-Language": language,
-                "X-Qwen-SampleRate": str(first_sr or ""),
+                "X-Qwen-SampleRate": str(merged_sr),
                 "X-Qwen-Chunks": str(len(parts)),
                 "X-Qwen-Chunked": "1" if chunk else "0",
                 "X-Qwen-Processing-Seconds": f"{elapsed_seconds:.3f}",
