@@ -66,7 +66,22 @@ from qwen_tts import Qwen3TTSModel
 # ----------------------------
 # Configuration
 # ----------------------------
-MODEL_ID = os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+RAW_MODEL_ID = os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+MODEL_ID_ALIASES = {
+    "qwen3-tts": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    "qwen-tts": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    "qwen3_tts": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+}
+
+
+def _resolve_model_id(raw_model_id: str) -> str:
+    candidate = (raw_model_id or "").strip()
+    if not candidate:
+        return "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+    return MODEL_ID_ALIASES.get(candidate.lower(), candidate)
+
+
+MODEL_ID = _resolve_model_id(RAW_MODEL_ID)
 if not torch.cuda.is_available():
     raise RuntimeError("CUDA not available, refusing CPU fallback")
 DEVICE = "cuda:0"
@@ -183,8 +198,17 @@ def force_greedy(obj, label: str):
         print(f"{PRINT_PREFIX} could not force greedy on {label}: {e}")
 
 
+if RAW_MODEL_ID.strip() and RAW_MODEL_ID.strip() != MODEL_ID:
+    status(f"startup: remapped model alias '{RAW_MODEL_ID}' -> '{MODEL_ID}'")
 status(f"startup: loading model={MODEL_ID} device={DEVICE} dtype={DTYPE}")
-model = Qwen3TTSModel.from_pretrained(MODEL_ID, device_map=DEVICE, dtype=DTYPE)
+try:
+    model = Qwen3TTSModel.from_pretrained(MODEL_ID, device_map=DEVICE, dtype=DTYPE)
+except OSError as e:
+    raise RuntimeError(
+        f"Failed to load Qwen TTS model '{MODEL_ID}'. "
+        "If you set QWEN_TTS_MODEL=qwen3-tts, use 'Qwen/Qwen3-TTS-12Hz-0.6B-Base' instead. "
+        "Also verify Hugging Face auth/network access."
+    ) from e
 status("startup: model loaded")
 
 
