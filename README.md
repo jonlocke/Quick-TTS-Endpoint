@@ -48,4 +48,6 @@ If `nvidia-smi` appears to show VRAM climbing chunk-by-chunk, tune cache compact
 
 `QWEN_CUDA_EMPTY_CACHE_EACH_CHUNK=1` is still supported and maps to `chunk` when policy is unset.
 
+When `generate_voice_clone(...)` and `create_voice_clone_prompt(...)` are both available in your installed `qwen-tts`, the server now builds the reference prompt once at startup and reuses it via `voice_clone_prompt` for subsequent generations.
+
 Input normalization: `/speak` now converts integer digits to words (e.g. `3` -> `three`) and strips non-speech symbols before synthesis.

@@ -213,6 +213,17 @@ else:
     _GEN_VOICE_CLONE_PARAMS = set()
     _GEN_VOICE_CLONE_ACCEPTS_VAR_KW = False
 
+_HAS_CREATE_VOICE_CLONE_PROMPT = hasattr(model, "create_voice_clone_prompt")
+if _HAS_CREATE_VOICE_CLONE_PROMPT:
+    _CREATE_VOICE_CLONE_PROMPT_PARAMS = set(inspect.signature(model.create_voice_clone_prompt).parameters)
+    _CREATE_VOICE_CLONE_PROMPT_ACCEPTS_VAR_KW = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in inspect.signature(model.create_voice_clone_prompt).parameters.values()
+    )
+else:
+    _CREATE_VOICE_CLONE_PROMPT_PARAMS = set()
+    _CREATE_VOICE_CLONE_PROMPT_ACCEPTS_VAR_KW = False
+
 
 def _resolve_training_paths() -> tuple[str, str]:
     """Resolve train.wav / train.txt using cwd + script directory fallback."""
@@ -360,6 +371,22 @@ def _build_voice_clone_kwargs() -> dict:
     elif "reference_text" in _GEN_VOICE_CLONE_PARAMS:
         kwargs["reference_text"] = transcript
 
+    can_pass_cached_prompt = _GEN_VOICE_CLONE_ACCEPTS_VAR_KW or "voice_clone_prompt" in _GEN_VOICE_CLONE_PARAMS
+    if kwargs and _HAS_CREATE_VOICE_CLONE_PROMPT and can_pass_cached_prompt:
+        prompt_kwargs = dict(kwargs)
+        if not _CREATE_VOICE_CLONE_PROMPT_ACCEPTS_VAR_KW:
+            prompt_kwargs = {k: v for k, v in prompt_kwargs.items() if k in _CREATE_VOICE_CLONE_PROMPT_PARAMS}
+
+        if prompt_kwargs:
+            try:
+                voice_clone_prompt = model.create_voice_clone_prompt(**prompt_kwargs)
+                kwargs = {"voice_clone_prompt": voice_clone_prompt}
+                status(
+                    "startup: prebuilt reusable voice_clone_prompt for generate_voice_clone"
+                )
+            except Exception as e:
+                status(f"startup: create_voice_clone_prompt failed; falling back to ref args ({e})")
+
     if kwargs:
         status(
             f"startup: voice cloning reference ready wav={wav_path} txt={txt_path} keys={sorted(kwargs.keys())}"
@@ -396,7 +423,7 @@ except Exception:
     SUPPORTED_SPEAKERS = []
 
 status(
-    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f}"
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f}"
 )
 
 
