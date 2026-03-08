@@ -25,6 +25,8 @@ Env overrides:
   QWEN_AUTOMIX_FP32   default: 0  (kept for compatibility; model dtype defaults to fp32 anyway)
   QWEN_FORCE_FP32     default: 1  (set 0 to try fp16 again)
   QWEN_PLAY_Q_MAX     default: 100
+  QWEN_WAV_ENCODER_THREADS default: 2 (CPU pool for WAV encoding)
+  QWEN_GPU_SYNTH_CONCURRENCY default: 1 (concurrent synth calls per worker; increase carefully)
 
 Deps (WSL):
   sudo apt-get install -y ffmpeg sox libsox-fmt-all
@@ -104,7 +106,8 @@ GEN_KWARGS = {
 
 PRINT_PREFIX = "[qwen-speak]"
 
-GPU_SYNTH_LOCK = threading.Lock()
+GPU_SYNTH_CONCURRENCY = max(1, int(os.environ.get("QWEN_GPU_SYNTH_CONCURRENCY", "1")))
+GPU_SYNTH_SEMAPHORE = threading.BoundedSemaphore(value=GPU_SYNTH_CONCURRENCY)
 
 app = FastAPI()
 
@@ -382,7 +385,7 @@ except Exception:
     SUPPORTED_SPEAKERS = []
 
 status(
-    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'}"
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY}"
 )
 
 
@@ -726,11 +729,6 @@ def speak(
     first_word_latency_seconds: Optional[float] = None
 
     def _finalize_chunk(chunk_idx: int, wav_bytes: bytes) -> None:
-        nonlocal first_chunk_latency_seconds, first_word_latency_seconds
-        if first_chunk_latency_seconds is None:
-            first_chunk_latency_seconds = time.perf_counter() - request_start
-            # Non-streaming synthesis does not expose per-word timings, so first playable chunk is the best proxy.
-            first_word_latency_seconds = first_chunk_latency_seconds
         jid = f"{os.getpid()}-{threading.get_ident()}-{chunk_idx}"
         job_ids.append(jid)
 
@@ -749,8 +747,18 @@ def speak(
 
         for idx, part in enumerate(parts):
             status(f"speak: processing chunk {idx + 1}/{len(parts)}")
-            with GPU_SYNTH_LOCK:
+            if idx == 0 and first_word_latency_seconds is None:
+                # Non-streaming API does not expose word boundaries; use synthesis start as first-word proxy.
+                first_word_latency_seconds = time.perf_counter() - request_start
+
+            GPU_SYNTH_SEMAPHORE.acquire()
+            try:
                 wav, sr = _synthesize_to_audio(part, speaker, language, instruct)
+            finally:
+                GPU_SYNTH_SEMAPHORE.release()
+
+            if idx == 0 and first_chunk_latency_seconds is None:
+                first_chunk_latency_seconds = time.perf_counter() - request_start
 
             if previous_encode is not None:
                 prev_idx, prev_future = previous_encode
@@ -770,10 +778,14 @@ def speak(
 
     elapsed_seconds = time.perf_counter() - request_start
     total_latency_seconds = elapsed_seconds
+    if first_word_latency_seconds is None:
+        first_word_latency_seconds = total_latency_seconds
+    if first_chunk_latency_seconds is None:
+        first_chunk_latency_seconds = total_latency_seconds
     completion_message = f"Request complete in {elapsed_seconds:.3f}s: {text}"
     status(
-        f"speak: latency first_word={first_word_latency_seconds if first_word_latency_seconds is not None else -1:.3f}s "
-        f"first_chunk={first_chunk_latency_seconds if first_chunk_latency_seconds is not None else -1:.3f}s "
+        f"speak: latency first_word={first_word_latency_seconds:.3f}s "
+        f"first_chunk={first_chunk_latency_seconds:.3f}s "
         f"total={total_latency_seconds:.3f}s"
     )
     status(completion_message)
@@ -790,8 +802,8 @@ def speak(
                 "X-Qwen-SampleRate": str(merged_sr),
                 "X-Qwen-Chunks": str(len(parts)),
                 "X-Qwen-Chunked": "1" if chunk else "0",
-                "X-Qwen-Latency-First-Word-Seconds": f"{(first_word_latency_seconds if first_word_latency_seconds is not None else total_latency_seconds):.3f}",
-                "X-Qwen-Latency-First-Chunk-Seconds": f"{(first_chunk_latency_seconds if first_chunk_latency_seconds is not None else total_latency_seconds):.3f}",
+                "X-Qwen-Latency-First-Word-Seconds": f"{first_word_latency_seconds:.3f}",
+                "X-Qwen-Latency-First-Chunk-Seconds": f"{first_chunk_latency_seconds:.3f}",
                 "X-Qwen-Processing-Seconds": f"{total_latency_seconds:.3f}",
             },
         )
@@ -801,8 +813,8 @@ def speak(
         "message": completion_message,
         "text": text,
         "processing_seconds": round(total_latency_seconds, 3),
-        "latency_to_first_word_seconds": round(first_word_latency_seconds, 3) if first_word_latency_seconds is not None else round(total_latency_seconds, 3),
-        "latency_to_first_chunk_seconds": round(first_chunk_latency_seconds, 3) if first_chunk_latency_seconds is not None else round(total_latency_seconds, 3),
+        "latency_to_first_word_seconds": round(first_word_latency_seconds, 3),
+        "latency_to_first_chunk_seconds": round(first_chunk_latency_seconds, 3),
         "total_latency_seconds": round(total_latency_seconds, 3),
         "queued": bool(play),
         "return_audio": bool(return_audio),
