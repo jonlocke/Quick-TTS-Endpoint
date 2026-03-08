@@ -286,7 +286,7 @@ def force_greedy_recursive(root, label: str):
 
 if RAW_MODEL_ID.strip() and RAW_MODEL_ID.strip() != MODEL_ID:
     status(f"startup: remapped model alias '{RAW_MODEL_ID}' -> '{MODEL_ID}'")
-status(f"startup: loading model={MODEL_ID} device={DEVICE} device_name={CUDA_DEVICE_NAME} requested_cuda_device={REQUESTED_CUDA_DEVICE or "auto"} dtype={_dtype_name(DTYPE)}")
+status(f"startup: loading model={MODEL_ID} device={DEVICE} device_name={CUDA_DEVICE_NAME} requested_cuda_device={REQUESTED_CUDA_DEVICE or 'auto'} dtype={_dtype_name(DTYPE)}")
 try:
     model = Qwen3TTSModel.from_pretrained(MODEL_ID, device_map=DEVICE, dtype=DTYPE)
 except OSError as e:
