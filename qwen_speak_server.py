@@ -80,6 +80,10 @@ FP16_RETRY_FP32 = os.environ.get("QWEN_FP16_RETRY_FP32", "1").strip() in ("1", "
 EMPTY_CACHE_EACH_CHUNK = os.environ.get("QWEN_CUDA_EMPTY_CACHE_EACH_CHUNK", "0").strip() in (
     "1", "true", "TRUE", "yes", "YES", "on", "ON"
 )
+CUDA_CACHE_CLEAR_POLICY = os.environ.get("QWEN_CUDA_CACHE_CLEAR_POLICY", "").strip().lower()
+if not CUDA_CACHE_CLEAR_POLICY:
+    CUDA_CACHE_CLEAR_POLICY = "chunk" if EMPTY_CACHE_EACH_CHUNK else "off"
+CUDA_CACHE_PRESSURE_THRESHOLD = float(os.environ.get("QWEN_CUDA_CACHE_PRESSURE_THRESHOLD", "0.92"))
 
 # Allow TF32 (helps newer GPUs; harmless on most)
 if torch.cuda.is_available():
@@ -392,7 +396,7 @@ except Exception:
     SUPPORTED_SPEAKERS = []
 
 status(
-    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'}"
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f}"
 )
 
 
@@ -638,15 +642,41 @@ def _synthesize_to_audio(text: str, speaker: str, language: str, instruct: str) 
     return wav, int(sr)
 
 
-def _maybe_compact_cuda_heap() -> None:
+def _maybe_compact_cuda_heap(stage: str) -> None:
     """
-    Optional mitigation for perceived per-chunk VRAM growth in nvidia-smi.
+    Optional mitigation for perceived VRAM growth from the CUDA caching allocator.
 
-    PyTorch keeps freed blocks in a caching allocator, which can look like memory
-    growth even when tensors are no longer live. This hook lets operators force a
-    cache release between chunks when desired.
+    Policies:
+      - off: disable explicit compaction
+      - chunk: compact after each chunk (legacy behavior)
+      - request: compact once when request completes
+      - pressure: compact only when GPU memory pressure crosses threshold
     """
-    if not (EMPTY_CACHE_EACH_CHUNK and torch.cuda.is_available()):
+    if not torch.cuda.is_available():
+        return
+
+    policy = CUDA_CACHE_CLEAR_POLICY
+    should_compact = False
+
+    if policy == "off":
+        return
+    if policy == "chunk":
+        should_compact = stage == "chunk"
+    elif policy == "request":
+        should_compact = stage == "request_end"
+    elif policy == "pressure":
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        used_ratio = 1.0 - (float(free_bytes) / float(total_bytes))
+        should_compact = used_ratio >= CUDA_CACHE_PRESSURE_THRESHOLD
+        if should_compact:
+            status(
+                f"speak: cuda pressure detected used_ratio={used_ratio:.3f} threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f}; compacting cache"
+            )
+    else:
+        status(f"startup: unknown QWEN_CUDA_CACHE_CLEAR_POLICY='{policy}', disabling cache compaction")
+        return
+
+    if not should_compact:
         return
 
     gc.collect()
@@ -800,7 +830,7 @@ def speak(
                 wav, sr = _synthesize_to_audio(part, speaker, language, instruct)
             finally:
                 GPU_SYNTH_SEMAPHORE.release()
-                _maybe_compact_cuda_heap()
+                _maybe_compact_cuda_heap(stage="chunk")
 
             if idx == 0 and first_chunk_latency_seconds is None:
                 # First-chunk proxy: when first synthesized chunk exits model inference.
@@ -835,6 +865,7 @@ def speak(
         f"total={total_latency_seconds:.3f}s"
     )
     status(completion_message)
+    _maybe_compact_cuda_heap(stage="request_end")
 
     if return_audio and audio_chunks:
         merged_wav, merged_sr = _concat_wav_bytes(audio_chunks)

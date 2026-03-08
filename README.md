@@ -39,6 +39,13 @@ falls back to `generate_custom_voice(...)` compatibility logic.
 
 If you are benchmarking GPU inference, call `/speak` with `play=false` to avoid ffplay server-side playback CPU overhead.
 
-If `nvidia-smi` appears to show VRAM climbing chunk-by-chunk, set `QWEN_CUDA_EMPTY_CACHE_EACH_CHUNK=1` to force cache compaction after each synthesized chunk (may trade some latency for steadier reported memory).
+If `nvidia-smi` appears to show VRAM climbing chunk-by-chunk, tune cache compaction with `QWEN_CUDA_CACHE_CLEAR_POLICY`:
+
+- `off` (default): fastest, keep allocator cache for reuse
+- `chunk`: compact after every chunk (legacy behavior; can add latency)
+- `request`: compact once at request end
+- `pressure`: compact only when used VRAM crosses `QWEN_CUDA_CACHE_PRESSURE_THRESHOLD` (default `0.92`)
+
+`QWEN_CUDA_EMPTY_CACHE_EACH_CHUNK=1` is still supported and maps to `chunk` when policy is unset.
 
 Input normalization: `/speak` now converts integer digits to words (e.g. `3` -> `three`) and strips non-speech symbols before synthesis.
