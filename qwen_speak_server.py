@@ -26,7 +26,8 @@ Env overrides:
   QWEN_FORCE_FP32     default: 1  (set 0 to try fp16 again)
   QWEN_PLAY_Q_MAX     default: 100
   QWEN_WAV_ENCODER_THREADS default: 2 (CPU pool for WAV encoding)
-  QWEN_GPU_SYNTH_CONCURRENCY default: 1 (concurrent synth calls per worker; increase carefully)
+  QWEN_GPU_SYNTH_CONCURRENCY default: 1 (max concurrent synth calls; can increase activation memory)
+  QWEN_SYNTH_DISPATCH_THREADS default: QWEN_GPU_SYNTH_CONCURRENCY (chunk synth task threads)
 
 Deps (WSL):
   sudo apt-get install -y ffmpeg sox libsox-fmt-all
@@ -108,6 +109,7 @@ PRINT_PREFIX = "[qwen-speak]"
 
 GPU_SYNTH_CONCURRENCY = max(1, int(os.environ.get("QWEN_GPU_SYNTH_CONCURRENCY", "1")))
 GPU_SYNTH_SEMAPHORE = threading.BoundedSemaphore(value=GPU_SYNTH_CONCURRENCY)
+SYNTH_DISPATCH_THREADS = max(1, int(os.environ.get("QWEN_SYNTH_DISPATCH_THREADS", str(GPU_SYNTH_CONCURRENCY))))
 
 app = FastAPI()
 
@@ -385,7 +387,7 @@ except Exception:
     SUPPORTED_SPEAKERS = []
 
 status(
-    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY}"
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} synth_dispatch_threads={SYNTH_DISPATCH_THREADS}"
 )
 
 
@@ -683,11 +685,24 @@ _worker_thread.start()
 
 ENCODER_POOL_SIZE = int(os.environ.get("QWEN_WAV_ENCODER_THREADS", "2"))
 encode_pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, ENCODER_POOL_SIZE))
+synth_pool = concurrent.futures.ThreadPoolExecutor(max_workers=SYNTH_DISPATCH_THREADS)
+
+
+def _synthesize_chunk_task(part: str, speaker: str, language: str, instruct: str, request_start: float):
+    synth_start = time.perf_counter()
+    GPU_SYNTH_SEMAPHORE.acquire()
+    try:
+        wav, sr = _synthesize_to_audio(part, speaker, language, instruct)
+    finally:
+        GPU_SYNTH_SEMAPHORE.release()
+    synth_end = time.perf_counter()
+    return wav, sr, synth_start - request_start, synth_end - request_start
 
 
 @app.on_event("shutdown")
 def _shutdown():
     _worker_stop.set()
+    synth_pool.shutdown(wait=False, cancel_futures=True)
     encode_pool.shutdown(wait=False, cancel_futures=True)
 
 
@@ -745,20 +760,19 @@ def speak(
     try:
         previous_encode: Optional[Tuple[int, concurrent.futures.Future[bytes]]] = None
 
-        for idx, part in enumerate(parts):
+        synth_futures = [
+            synth_pool.submit(_synthesize_chunk_task, part, speaker, language, instruct, request_start)
+            for part in parts
+        ]
+
+        for idx, synth_future in enumerate(synth_futures):
             status(f"speak: processing chunk {idx + 1}/{len(parts)}")
+            wav, sr, synth_start_rel, synth_end_rel = synth_future.result()
+
             if idx == 0 and first_word_latency_seconds is None:
-                # Non-streaming API does not expose word boundaries; use synthesis start as first-word proxy.
-                first_word_latency_seconds = time.perf_counter() - request_start
-
-            GPU_SYNTH_SEMAPHORE.acquire()
-            try:
-                wav, sr = _synthesize_to_audio(part, speaker, language, instruct)
-            finally:
-                GPU_SYNTH_SEMAPHORE.release()
-
+                first_word_latency_seconds = synth_start_rel
             if idx == 0 and first_chunk_latency_seconds is None:
-                first_chunk_latency_seconds = time.perf_counter() - request_start
+                first_chunk_latency_seconds = synth_end_rel
 
             if previous_encode is not None:
                 prev_idx, prev_future = previous_encode
