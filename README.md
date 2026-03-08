@@ -51,3 +51,17 @@ If `nvidia-smi` appears to show VRAM climbing chunk-by-chunk, tune cache compact
 When `generate_voice_clone(...)` and `create_voice_clone_prompt(...)` are both available in your installed `qwen-tts`, the server now builds the reference prompt once at startup and reuses it via `voice_clone_prompt` for subsequent generations.
 
 Input normalization: `/speak` now converts integer digits to words (e.g. `3` -> `three`) and strips non-speech symbols before synthesis.
+
+
+## Low-latency chunk delivery to clients
+
+`POST /speak` now supports incremental chunk delivery for clients that want to start
+playback immediately:
+
+- `stream_audio_chunks=1`: returns `application/x-ndjson` where each line is JSON.
+  - `{"type":"audio_chunk", ... "audio_b64_wav":"..."}` for each chunk
+  - final `{"type":"complete", ...}` summary record
+- `paragraph_chunking=1` (default): keeps paragraph boundaries as chunks when the
+  paragraph is within `max_chars`; overlong paragraphs fall back to sentence chunking.
+
+`stream_audio_chunks=1` cannot be combined with `return_audio=1`.

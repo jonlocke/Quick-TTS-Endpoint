@@ -34,6 +34,8 @@ Deps (WSL):
   pip install fastapi uvicorn soundfile numpy torch qwen-tts
 """
 import io
+import base64
+import json
 import concurrent.futures
 import inspect
 import gc
@@ -48,7 +50,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import Response, JSONResponse
+from fastapi.responses import Response, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 import numpy as np
@@ -463,8 +465,8 @@ def _concat_audio(chunks: list[np.ndarray]) -> np.ndarray:
     return np.concatenate(fixed, axis=0)
 
 
-def _chunk_text(text: str, max_chars: int = 240) -> list[str]:
-    """Cheap sentence-ish splitter + length cap."""
+def _chunk_text_sentence(text: str, max_chars: int = 240) -> list[str]:
+    """Sentence-ish splitter + length cap for a single text block."""
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return []
@@ -486,7 +488,6 @@ def _chunk_text(text: str, max_chars: int = 240) -> list[str]:
         if not p:
             continue
 
-        # Hard wrap a single overlong sentence
         if len(p) > max_chars:
             if buf:
                 flush()
@@ -504,7 +505,6 @@ def _chunk_text(text: str, max_chars: int = 240) -> list[str]:
     if buf:
         flush()
 
-    # Merge tiny trailing bits
     merged: list[str] = []
     for c in chunks:
         if merged and len(c) < 30:
@@ -512,6 +512,32 @@ def _chunk_text(text: str, max_chars: int = 240) -> list[str]:
         else:
             merged.append(c)
     return merged
+
+
+def _chunk_text(text: str, max_chars: int = 240, paragraph_aware: bool = True) -> list[str]:
+    """Paragraph-first chunking with sentence fallback when paragraph exceeds max_chars."""
+    if not paragraph_aware:
+        return _chunk_text_sentence(text, max_chars=max_chars)
+
+    raw = (text or "").strip()
+    if not raw:
+        return []
+
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", raw) if p.strip()]
+    if not paragraphs:
+        return _chunk_text_sentence(raw, max_chars=max_chars)
+
+    out: list[str] = []
+    for para in paragraphs:
+        para_inline = re.sub(r"\s+", " ", para).strip()
+        if not para_inline:
+            continue
+        if len(para_inline) <= max_chars:
+            out.append(para_inline)
+        else:
+            out.extend(_chunk_text_sentence(para_inline, max_chars=max_chars))
+
+    return out
 
 
 _NUM_0_TO_19 = [
@@ -800,14 +826,16 @@ def speak(
     req: SpeakReq,
     play: bool = Query(True, description="If true (default), queue server-side playback via ffplay"),
     return_audio: bool = Query(False, description="If true, return audio/wav bytes (all chunks) instead of JSON"),
-    chunk: bool = Query(True, description="If true (default), split into sentence-ish chunks"),
+    stream_audio_chunks: bool = Query(False, description="If true, stream NDJSON records with base64 WAV per chunk for low-latency client playback"),
+    chunk: bool = Query(True, description="If true (default), split text into chunks"),
+    paragraph_chunking: bool = Query(True, description="If true (default), keep paragraphs as chunks when under max_chars"),
     max_chars: int = Query(240, ge=80, le=800, description="Chunk size cap"),
 ):
     request_start = time.perf_counter()
     status("speak: request received")
 
-    text = _normalize_text_for_tts((req.text or "").strip())
-    if not text:
+    raw_text = (req.text or "").strip()
+    if not raw_text:
         return Response(status_code=204)
 
     speaker = (req.speaker or DEFAULT_SPEAKER).strip().lower()
@@ -819,10 +847,18 @@ def speak(
     if SUPPORTED_LANGS and language not in SUPPORTED_LANGS:
         raise HTTPException(status_code=400, detail=f"Unsupported language '{language}'. Use GET /languages")
 
-    parts = _chunk_text(text, max_chars=max_chars) if chunk else [text]
-    status(f"speak: chunking complete chunks={len(parts)} chunking={'on' if chunk else 'off'}")
+    raw_parts = _chunk_text(raw_text, max_chars=max_chars, paragraph_aware=paragraph_chunking) if chunk else [raw_text]
+    parts = [_normalize_text_for_tts(p) for p in raw_parts]
+    parts = [p for p in parts if p]
+    text = " ".join(parts).strip()
+    status(
+        f"speak: chunking complete chunks={len(parts)} chunking={'on' if chunk else 'off'} paragraph_chunking={'on' if paragraph_chunking else 'off'}"
+    )
     if not parts:
         return Response(status_code=204)
+
+    if return_audio and stream_audio_chunks:
+        raise HTTPException(status_code=400, detail="Choose only one: return_audio=1 or stream_audio_chunks=1")
 
     job_ids = []
     audio_chunks: list[bytes] = []
@@ -842,6 +878,69 @@ def speak(
 
         if return_audio:
             audio_chunks.append(wav_bytes)
+
+
+    if stream_audio_chunks:
+        def _stream_ndjson():
+            nonlocal first_word_latency_seconds, first_chunk_latency_seconds
+            try:
+                for idx, part in enumerate(parts):
+                    status(f"speak: processing chunk {idx + 1}/{len(parts)} (stream)")
+
+                    GPU_SYNTH_SEMAPHORE.acquire()
+                    try:
+                        if idx == 0 and first_word_latency_seconds is None:
+                            first_word_latency_seconds = time.perf_counter() - request_start
+                        wav, sr = _synthesize_to_audio(part, speaker, language, instruct)
+                    finally:
+                        GPU_SYNTH_SEMAPHORE.release()
+                        _maybe_compact_cuda_heap(stage="chunk")
+
+                    if idx == 0 and first_chunk_latency_seconds is None:
+                        first_chunk_latency_seconds = time.perf_counter() - request_start
+
+                    wav_bytes = _encode_wav_bytes(wav, sr)
+                    _finalize_chunk(idx, wav_bytes)
+
+                    yield (json.dumps({
+                        "type": "audio_chunk",
+                        "chunk_index": idx,
+                        "chunks_total": len(parts),
+                        "sample_rate": int(sr),
+                        "text": part,
+                        "audio_b64_wav": base64.b64encode(wav_bytes).decode("ascii"),
+                    }) + "\n").encode("utf-8")
+
+                elapsed_seconds = time.perf_counter() - request_start
+                total_latency_seconds = elapsed_seconds
+                fw = first_word_latency_seconds if first_word_latency_seconds is not None else total_latency_seconds
+                fc = first_chunk_latency_seconds if first_chunk_latency_seconds is not None else total_latency_seconds
+                completion_message = f"Request complete in {elapsed_seconds:.3f}s: {text}"
+                status(
+                    f"speak: latency first_word={fw:.3f}s first_chunk={fc:.3f}s total={total_latency_seconds:.3f}s"
+                )
+                status(completion_message)
+                _maybe_compact_cuda_heap(stage="request_end")
+
+                yield (json.dumps({
+                    "type": "complete",
+                    "ok": True,
+                    "message": completion_message,
+                    "chunks": len(parts),
+                    "speaker": speaker,
+                    "language": language,
+                    "processing_seconds": round(total_latency_seconds, 3),
+                    "latency_to_first_word_seconds": round(fw, 3),
+                    "latency_to_first_chunk_seconds": round(fc, 3),
+                    "queue_depth": play_q.qsize(),
+                    "job_ids": job_ids[:10],
+                }) + "\n").encode("utf-8")
+            except Exception as e:
+                traceback.print_exc()
+                err_payload = {"type": "error", "ok": False, "detail": str(e)}
+                yield (json.dumps(err_payload) + "\n").encode("utf-8")
+
+        return StreamingResponse(_stream_ndjson(), media_type="application/x-ndjson")
 
     try:
         previous_encode: Optional[Tuple[int, concurrent.futures.Future[bytes]]] = None
@@ -923,6 +1022,8 @@ def speak(
         "queued": bool(play),
         "return_audio": bool(return_audio),
         "chunked": bool(chunk),
+        "paragraph_chunking": bool(paragraph_chunking),
+        "stream_audio_chunks": bool(stream_audio_chunks),
         "chunks": len(parts),
         "max_chars": max_chars,
         "speaker": speaker,
