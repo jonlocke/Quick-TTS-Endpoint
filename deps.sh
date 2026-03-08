@@ -6,7 +6,7 @@ APPDIR="$HOME/Quick-TTS-Endpoint"
 
 echo "[1/5] System dependencies (ffmpeg, sox)..."
 sudo apt-get update
-sudo apt-get install -y ffmpeg sox libsox-fmt-all
+sudo apt-get install -y ffmpeg sox libsox-fmt-all libnvrtc11.2
 
 echo "[2/5] Create venv (if missing) + upgrade pip tooling..."
 if [[ ! -d "$VENV" ]]; then
