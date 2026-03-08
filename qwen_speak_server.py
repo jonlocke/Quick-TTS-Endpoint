@@ -27,6 +27,7 @@ Env overrides:
   QWEN_PLAY_Q_MAX     default: 100
   QWEN_WAV_ENCODER_THREADS default: 2 (CPU pool for WAV encoding)
   QWEN_GPU_SYNTH_CONCURRENCY default: 1 (max concurrent synth calls; can increase activation memory)
+  QWEN_FP16_RETRY_FP32 default: 1 (retry failed fp16 synth in fp32 autocast-off mode)
 
 Deps (WSL):
   sudo apt-get install -y ffmpeg sox libsox-fmt-all
@@ -74,6 +75,7 @@ else:
 
 # Optional: compute in fp32 while keeping fp16 weights (extra stability) - mostly irrelevant if DTYPE=fp32
 AUTOMIX_FP32 = os.environ.get("QWEN_AUTOMIX_FP32", "0").strip() in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
+FP16_RETRY_FP32 = os.environ.get("QWEN_FP16_RETRY_FP32", "1").strip() in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
 
 # Allow TF32 (helps newer GPUs; harmless on most)
 if torch.cuda.is_available():
@@ -386,7 +388,7 @@ except Exception:
     SUPPORTED_SPEAKERS = []
 
 status(
-    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY}"
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'}"
 )
 
 
@@ -520,6 +522,32 @@ def _normalize_text_for_tts(text: str) -> str:
     return normalized
 
 
+def _is_fp16_sampling_error(err: RuntimeError) -> bool:
+    msg = str(err).lower()
+    return ("probability tensor contains" in msg) or ("nan" in msg) or ("inf" in msg)
+
+
+def _run_generation_with_fp16_retry(gen_fn, kwargs: dict, label: str):
+    with torch.inference_mode():
+        try:
+            if DEVICE.startswith("cuda") and AUTOMIX_FP32 and DTYPE == torch.float16:
+                with torch.autocast(device_type="cuda", dtype=torch.float32, enabled=True):
+                    return gen_fn(**kwargs)
+            return gen_fn(**kwargs)
+        except RuntimeError as err:
+            should_retry = DEVICE.startswith("cuda") and DTYPE == torch.float16 and FP16_RETRY_FP32 and _is_fp16_sampling_error(err)
+            if not should_retry:
+                raise
+
+            status(f"speak: {label} fp16 instability detected; retrying once with fp32-safe path")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            with torch.autocast(device_type="cuda", enabled=False):
+                return gen_fn(**kwargs)
+
+
+
+
 def _synthesize_to_audio(text: str, speaker: str, language: str, instruct: str) -> Tuple[np.ndarray, int]:
     current_dev = _ensure_model_cuda()
     use_voice_clone_api = bool(VOICE_CLONE_KWARGS) and _HAS_GEN_VOICE_CLONE
@@ -541,12 +569,11 @@ def _synthesize_to_audio(text: str, speaker: str, language: str, instruct: str) 
         sent_ref_keys = [k for k in clone_kwargs if k in VOICE_CLONE_KWARGS]
         status(f"speak: using generate_voice_clone ref args={sorted(sent_ref_keys)}")
 
-        with torch.inference_mode():
-            if DEVICE.startswith("cuda") and AUTOMIX_FP32 and DTYPE == torch.float16:
-                with torch.autocast(device_type="cuda", dtype=torch.float32, enabled=True):
-                    audio_list, sr = model.generate_voice_clone(**clone_kwargs)
-            else:
-                audio_list, sr = model.generate_voice_clone(**clone_kwargs)
+        audio_list, sr = _run_generation_with_fp16_retry(
+            model.generate_voice_clone,
+            clone_kwargs,
+            label="generate_voice_clone",
+        )
 
         wav = _concat_audio(audio_list)
         if wav.size == 0:
@@ -593,12 +620,11 @@ def _synthesize_to_audio(text: str, speaker: str, language: str, instruct: str) 
     prompt_keys_sent = [k for k in call_kwargs if k in TRAINING_VOICE_KWARGS]
     status(f"speak: voice prompt args in call={sorted(prompt_keys_sent)}")
 
-    with torch.inference_mode():
-        if DEVICE.startswith("cuda") and AUTOMIX_FP32 and DTYPE == torch.float16:
-            with torch.autocast(device_type="cuda", dtype=torch.float32, enabled=True):
-                audio_list, sr = model.generate_custom_voice(**call_kwargs)
-        else:
-            audio_list, sr = model.generate_custom_voice(**call_kwargs)
+    audio_list, sr = _run_generation_with_fp16_retry(
+        model.generate_custom_voice,
+        call_kwargs,
+        label="generate_custom_voice",
+    )
 
     wav = _concat_audio(audio_list)
     if wav.size == 0:
