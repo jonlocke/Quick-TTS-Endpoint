@@ -64,7 +64,28 @@ from qwen_tts import Qwen3TTSModel
 # ----------------------------
 # Configuration
 # ----------------------------
-MODEL_ID = os.environ.get("QWEN_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+DEFAULT_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+MODEL_ID_ALIASES = {
+    # Common shorthand people use in docs/shell profiles.
+    "qwen3-tts": DEFAULT_MODEL_ID,
+    "qwen-tts": DEFAULT_MODEL_ID,
+    "qwen3_tts": DEFAULT_MODEL_ID,
+}
+
+
+def _resolve_model_id(raw_model_id: str) -> str:
+    candidate = raw_model_id.strip()
+    if not candidate:
+        return DEFAULT_MODEL_ID
+
+    alias_hit = MODEL_ID_ALIASES.get(candidate.lower())
+    if alias_hit:
+        print(f"[qwen-speak] startup: normalized QWEN_TTS_MODEL='{candidate}' -> '{alias_hit}'", flush=True)
+        return alias_hit
+    return candidate
+
+
+MODEL_ID = _resolve_model_id(os.environ.get("QWEN_TTS_MODEL", DEFAULT_MODEL_ID))
 if not torch.cuda.is_available():
     raise RuntimeError("CUDA not available, refusing CPU fallback")
 DEVICE = "cuda:0"
