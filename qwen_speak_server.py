@@ -31,10 +31,10 @@ Deps (WSL):
   pip install fastapi uvicorn soundfile numpy torch qwen-tts
 """
 import io
+import concurrent.futures
 import inspect
 import os
 import re
-import tempfile
 import subprocess
 import threading
 import time
@@ -103,6 +103,8 @@ GEN_KWARGS = {
 }
 
 PRINT_PREFIX = "[qwen-speak]"
+
+GPU_SYNTH_LOCK = threading.Lock()
 
 app = FastAPI()
 
@@ -514,7 +516,7 @@ def _normalize_text_for_tts(text: str) -> str:
     return normalized
 
 
-def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: str) -> Tuple[bytes, int]:
+def _synthesize_to_audio(text: str, speaker: str, language: str, instruct: str) -> Tuple[np.ndarray, int]:
     current_dev = _ensure_model_cuda()
     use_voice_clone_api = bool(VOICE_CLONE_KWARGS) and _HAS_GEN_VOICE_CLONE
     is_cloned_voice = use_voice_clone_api or bool(TRAINING_VOICE_KWARGS)
@@ -546,10 +548,8 @@ def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: s
         if wav.size == 0:
             raise RuntimeError("Empty audio output from model")
 
-        buf = io.BytesIO()
-        sf.write(buf, wav, int(sr), format="WAV")
         status(f"speak: cloning voice finished sr={int(sr)} samples={wav.size}")
-        return buf.getvalue(), int(sr)
+        return wav, int(sr)
 
     call_kwargs = {
         "text": text,
@@ -600,10 +600,14 @@ def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: s
     if wav.size == 0:
         raise RuntimeError("Empty audio output from model")
 
+    status(f"speak: cloning voice finished sr={int(sr)} samples={wav.size}")
+    return wav, int(sr)
+
+
+def _encode_wav_bytes(wav: np.ndarray, sr: int) -> bytes:
     buf = io.BytesIO()
     sf.write(buf, wav, int(sr), format="WAV")
-    status(f"speak: cloning voice finished sr={int(sr)} samples={wav.size}")
-    return buf.getvalue(), int(sr)
+    return buf.getvalue()
 
 
 def _concat_wav_bytes(wav_chunks: list[bytes]) -> Tuple[bytes, int]:
@@ -648,20 +652,12 @@ _worker_stop = threading.Event()
 
 
 def _play_wav_bytes(wav_bytes: bytes) -> None:
-    # Write to temp .wav and play via ffplay
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
-        f.write(wav_bytes)
-        path = f.name
-    try:
-        subprocess.run(
-            ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path],
-            check=False,
-        )
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+    # Stream wav bytes directly to ffplay stdin (avoids temp-file churn).
+    subprocess.run(
+        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"],
+        input=wav_bytes,
+        check=False,
+    )
 
 
 def _worker_loop():
@@ -682,9 +678,14 @@ _worker_thread = threading.Thread(target=_worker_loop, daemon=True)
 _worker_thread.start()
 
 
+ENCODER_POOL_SIZE = int(os.environ.get("QWEN_WAV_ENCODER_THREADS", "2"))
+encode_pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, ENCODER_POOL_SIZE))
+
+
 @app.on_event("shutdown")
 def _shutdown():
     _worker_stop.set()
+    encode_pool.shutdown(wait=False, cancel_futures=True)
 
 
 # ----------------------------
@@ -722,22 +723,37 @@ def speak(
     job_ids = []
     audio_chunks: list[bytes] = []
 
+    def _finalize_chunk(chunk_idx: int, wav_bytes: bytes) -> None:
+        jid = f"{os.getpid()}-{threading.get_ident()}-{chunk_idx}"
+        job_ids.append(jid)
+
+        if play:
+            try:
+                play_q.put_nowait(SpeakJob(wav_bytes=wav_bytes, job_id=jid))
+                status(f"speak: queued playback job={jid} depth={play_q.qsize()}")
+            except queue.Full:
+                raise HTTPException(status_code=429, detail="Playback queue is full")
+
+        if return_audio:
+            audio_chunks.append(wav_bytes)
+
     try:
+        previous_encode: Optional[Tuple[int, concurrent.futures.Future[bytes]]] = None
+
         for idx, part in enumerate(parts):
             status(f"speak: processing chunk {idx + 1}/{len(parts)}")
-            wav_bytes, _sr = _synthesize_to_wav_bytes(part, speaker, language, instruct)
-            jid = f"{os.getpid()}-{threading.get_ident()}-{idx}"
-            job_ids.append(jid)
+            with GPU_SYNTH_LOCK:
+                wav, sr = _synthesize_to_audio(part, speaker, language, instruct)
 
-            if play:
-                try:
-                    play_q.put_nowait(SpeakJob(wav_bytes=wav_bytes, job_id=jid))
-                    status(f"speak: queued playback job={jid} depth={play_q.qsize()}")
-                except queue.Full:
-                    raise HTTPException(status_code=429, detail="Playback queue is full")
+            if previous_encode is not None:
+                prev_idx, prev_future = previous_encode
+                _finalize_chunk(prev_idx, prev_future.result())
 
-            if return_audio:
-                audio_chunks.append(wav_bytes)
+            previous_encode = (idx, encode_pool.submit(_encode_wav_bytes, wav, sr))
+
+        if previous_encode is not None:
+            last_idx, last_future = previous_encode
+            _finalize_chunk(last_idx, last_future.result())
 
     except HTTPException:
         raise
