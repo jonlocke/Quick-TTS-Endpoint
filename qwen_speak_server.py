@@ -30,6 +30,7 @@ Env overrides:
   QWEN_GPU_SYNTH_CONCURRENCY default: 1 (max concurrent synth calls; can increase activation memory)
   QWEN_FP16_RETRY_FP32 default: 1 (retry failed fp16 synth in fp32 autocast-off mode)
   QWEN_FP16_PROMOTE_MODEL_BF16 default: 1 (on repeated fp16 NaN/Inf sampling, cast live model to bf16 and retry)
+  QWEN_REMOVE_INVALID_VALUES default: 1 (ask HF generation to sanitize NaN/Inf logits before sampling)
 
 Deps (WSL):
   sudo apt-get install -y ffmpeg sox libsox-fmt-all
@@ -158,6 +159,10 @@ GEN_KWARGS = {
     "temperature": 1.0,
     "top_p": 1.0,
 }
+REMOVE_INVALID_VALUES = os.environ.get("QWEN_REMOVE_INVALID_VALUES", "1").strip().lower() in ("1", "true", "yes", "on")
+if REMOVE_INVALID_VALUES:
+    GEN_KWARGS["remove_invalid_values"] = True
+    GEN_KWARGS["renormalize_logits"] = True
 
 PRINT_PREFIX = "[qwen-speak]"
 
@@ -193,9 +198,31 @@ def force_greedy(obj, label: str):
             gc.top_p = 1.0
             if hasattr(gc, "top_k"):
                 gc.top_k = 0
+            if hasattr(gc, "remove_invalid_values"):
+                gc.remove_invalid_values = True
+            if hasattr(gc, "renormalize_logits"):
+                gc.renormalize_logits = True
             print(f"{PRINT_PREFIX} forced greedy on {label}")
     except Exception as e:
         print(f"{PRINT_PREFIX} could not force greedy on {label}: {e}")
+
+
+def force_greedy_recursive(root, label: str):
+    """Apply greedy/safe generation config to root and nested modules with generation_config."""
+    seen = set()
+    stack = [(label, root)]
+    while stack:
+        node_label, node = stack.pop()
+        if node is None:
+            continue
+        obj_id = id(node)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+        force_greedy(node, node_label)
+        for child_name in ("model", "talker", "code_predictor"):
+            if hasattr(node, child_name):
+                stack.append((f"{node_label}.{child_name}", getattr(node, child_name)))
 
 
 if RAW_MODEL_ID.strip() and RAW_MODEL_ID.strip() != MODEL_ID:
@@ -458,10 +485,7 @@ VOICE_CLONE_KWARGS = _build_voice_clone_kwargs()
 
 # Force greedy decoding on internal components (critical for stability)
 try:
-    force_greedy(model.model, "model.model")
-    for sub_name in ("talker", "code_predictor"):
-        if hasattr(model.model, sub_name):
-            force_greedy(getattr(model.model, sub_name), f"model.model.{sub_name}")
+    force_greedy_recursive(model, "model")
 except Exception as e:
     print(f"{PRINT_PREFIX} warning: could not apply greedy forcing: {e}")
 
@@ -477,7 +501,7 @@ except Exception:
     SUPPORTED_SPEAKERS = []
 
 status(
-    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} fp16_promote_bf16={'on' if FP16_PROMOTE_MODEL_BF16 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f}"
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} fp16_promote_bf16={'on' if FP16_PROMOTE_MODEL_BF16 else 'off'} remove_invalid_values={'on' if REMOVE_INVALID_VALUES else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f}"
 )
 
 
@@ -749,10 +773,7 @@ def _run_generation_with_fp16_retry(gen_fn, kwargs: dict, label: str):
                     if hasattr(model, "code_predictor") and model.code_predictor is not None:
                         model.code_predictor = model.code_predictor.to(dtype=torch.bfloat16)
                     DTYPE = torch.bfloat16
-                    force_greedy(model.model, "model.model")
-                    for sub_name in ("talker", "code_predictor"):
-                        if hasattr(model.model, sub_name):
-                            force_greedy(getattr(model.model, sub_name), f"model.model.{sub_name}")
+                    force_greedy_recursive(model, "model")
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     return gen_fn(**kwargs)
