@@ -39,5 +39,29 @@ falls back to `generate_custom_voice(...)` compatibility logic.
 
 If you are benchmarking GPU inference, call `/speak` with `play=false` to avoid ffplay server-side playback CPU overhead.
 
+If `nvidia-smi` appears to show VRAM climbing chunk-by-chunk, tune cache compaction with `QWEN_CUDA_CACHE_CLEAR_POLICY`:
+
+- `off` (default): fastest, keep allocator cache for reuse
+- `chunk`: compact after every chunk (legacy behavior; can add latency)
+- `request`: compact once at request end
+- `pressure`: compact only when used VRAM crosses `QWEN_CUDA_CACHE_PRESSURE_THRESHOLD` (default `0.92`)
+
+`QWEN_CUDA_EMPTY_CACHE_EACH_CHUNK=1` is still supported and maps to `chunk` when policy is unset.
+
+When `generate_voice_clone(...)` and `create_voice_clone_prompt(...)` are both available in your installed `qwen-tts`, the server now builds the reference prompt once at startup and reuses it via `voice_clone_prompt` for subsequent generations.
 
 Input normalization: `/speak` now converts integer digits to words (e.g. `3` -> `three`) and strips non-speech symbols before synthesis.
+
+
+## Low-latency chunk delivery to clients
+
+`POST /speak` now supports incremental chunk delivery for clients that want to start
+playback immediately:
+
+- `stream_audio_chunks=1`: returns `application/x-ndjson` where each line is JSON.
+  - `{"type":"audio_chunk", ... "audio_b64_wav":"..."}` for each chunk
+  - final `{"type":"complete", ...}` summary record
+- `paragraph_chunking=1` (default): keeps paragraph boundaries as chunks when the
+  paragraph is within `max_chars`; overlong paragraphs fall back to sentence chunking.
+
+`stream_audio_chunks=1` cannot be combined with `return_audio=1`.
