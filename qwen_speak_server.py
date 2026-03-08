@@ -116,6 +116,16 @@ def _resolve_requested_dtype() -> torch.dtype:
 
 DTYPE = _resolve_requested_dtype()
 
+
+def _dtype_name(dtype_obj: torch.dtype) -> str:
+    if dtype_obj == torch.float16:
+        return "fp16"
+    if dtype_obj == torch.bfloat16:
+        return "bf16"
+    if dtype_obj == torch.float32:
+        return "fp32"
+    return str(dtype_obj)
+
 # Optional: compute in fp32 while keeping fp16 weights (extra stability) - only applies when DTYPE=fp16.
 AUTOMIX_FP32 = os.environ.get("QWEN_AUTOMIX_FP32", "0").strip() in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
 FP16_RETRY_FP32 = os.environ.get("QWEN_FP16_RETRY_FP32", "1").strip() in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
@@ -227,7 +237,7 @@ def force_greedy_recursive(root, label: str):
 
 if RAW_MODEL_ID.strip() and RAW_MODEL_ID.strip() != MODEL_ID:
     status(f"startup: remapped model alias '{RAW_MODEL_ID}' -> '{MODEL_ID}'")
-status(f"startup: loading model={MODEL_ID} device={DEVICE} dtype={DTYPE}")
+status(f"startup: loading model={MODEL_ID} device={DEVICE} dtype={_dtype_name(DTYPE)}")
 try:
     model = Qwen3TTSModel.from_pretrained(MODEL_ID, device_map=DEVICE, dtype=DTYPE)
 except OSError as e:
@@ -501,7 +511,7 @@ except Exception:
     SUPPORTED_SPEAKERS = []
 
 status(
-    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} fp16_promote_bf16={'on' if FP16_PROMOTE_MODEL_BF16 else 'off'} remove_invalid_values={'on' if REMOVE_INVALID_VALUES else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f}"
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} active_dtype={_dtype_name(DTYPE)} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} fp16_promote_bf16={'on' if FP16_PROMOTE_MODEL_BF16 else 'off'} remove_invalid_values={'on' if REMOVE_INVALID_VALUES else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f}"
 )
 
 
@@ -511,7 +521,9 @@ def health():
         "ok": True,
         "model": MODEL_ID,
         "device": DEVICE,
-        "dtype": str(DTYPE),
+        "dtype": _dtype_name(DTYPE),
+        "requested_dtype": REQUESTED_DTYPE,
+        "cuda_bf16_available": CUDA_BF16_AVAILABLE,
         "queue_depth": play_q.qsize(),
         "supported_speakers": len(SUPPORTED_SPEAKERS),
         "supported_languages": len(SUPPORTED_LANGS),
@@ -790,7 +802,7 @@ def _synthesize_to_audio(text: str, speaker: str, language: str, instruct: str) 
     is_cloned_voice = use_voice_clone_api or bool(TRAINING_VOICE_KWARGS)
     speaker_label = "cloned" if is_cloned_voice else speaker
     status(f"speak: cloning voice (len={len(text)} chars, speaker={speaker_label}, language={language})")
-    status(f"speak: runtime model device={current_dev}")
+    status(f"speak: runtime model device={current_dev} dtype={_dtype_name(DTYPE)} requested_dtype={REQUESTED_DTYPE} bf16_available={CUDA_BF16_AVAILABLE}")
 
     if use_voice_clone_api:
         clone_kwargs = {
