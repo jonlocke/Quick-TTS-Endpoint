@@ -722,8 +722,15 @@ def speak(
 
     job_ids = []
     audio_chunks: list[bytes] = []
+    first_chunk_latency_seconds: Optional[float] = None
+    first_word_latency_seconds: Optional[float] = None
 
     def _finalize_chunk(chunk_idx: int, wav_bytes: bytes) -> None:
+        nonlocal first_chunk_latency_seconds, first_word_latency_seconds
+        if first_chunk_latency_seconds is None:
+            first_chunk_latency_seconds = time.perf_counter() - request_start
+            # Non-streaming synthesis does not expose per-word timings, so first playable chunk is the best proxy.
+            first_word_latency_seconds = first_chunk_latency_seconds
         jid = f"{os.getpid()}-{threading.get_ident()}-{chunk_idx}"
         job_ids.append(jid)
 
@@ -762,7 +769,13 @@ def speak(
         raise HTTPException(status_code=500, detail=str(e))
 
     elapsed_seconds = time.perf_counter() - request_start
+    total_latency_seconds = elapsed_seconds
     completion_message = f"Request complete in {elapsed_seconds:.3f}s: {text}"
+    status(
+        f"speak: latency first_word={first_word_latency_seconds if first_word_latency_seconds is not None else -1:.3f}s "
+        f"first_chunk={first_chunk_latency_seconds if first_chunk_latency_seconds is not None else -1:.3f}s "
+        f"total={total_latency_seconds:.3f}s"
+    )
     status(completion_message)
 
     if return_audio and audio_chunks:
@@ -777,7 +790,9 @@ def speak(
                 "X-Qwen-SampleRate": str(merged_sr),
                 "X-Qwen-Chunks": str(len(parts)),
                 "X-Qwen-Chunked": "1" if chunk else "0",
-                "X-Qwen-Processing-Seconds": f"{elapsed_seconds:.3f}",
+                "X-Qwen-Latency-First-Word-Seconds": f"{(first_word_latency_seconds if first_word_latency_seconds is not None else total_latency_seconds):.3f}",
+                "X-Qwen-Latency-First-Chunk-Seconds": f"{(first_chunk_latency_seconds if first_chunk_latency_seconds is not None else total_latency_seconds):.3f}",
+                "X-Qwen-Processing-Seconds": f"{total_latency_seconds:.3f}",
             },
         )
 
@@ -785,7 +800,10 @@ def speak(
         "ok": True,
         "message": completion_message,
         "text": text,
-        "processing_seconds": round(elapsed_seconds, 3),
+        "processing_seconds": round(total_latency_seconds, 3),
+        "latency_to_first_word_seconds": round(first_word_latency_seconds, 3) if first_word_latency_seconds is not None else round(total_latency_seconds, 3),
+        "latency_to_first_chunk_seconds": round(first_chunk_latency_seconds, 3) if first_chunk_latency_seconds is not None else round(total_latency_seconds, 3),
+        "total_latency_seconds": round(total_latency_seconds, 3),
         "queued": bool(play),
         "return_audio": bool(return_audio),
         "chunked": bool(chunk),
