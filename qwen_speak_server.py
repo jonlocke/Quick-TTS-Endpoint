@@ -465,7 +465,7 @@ def _concat_audio(chunks: list[np.ndarray]) -> np.ndarray:
     return np.concatenate(fixed, axis=0)
 
 
-def _chunk_text_sentence(text: str, max_chars: int = 240) -> list[str]:
+def _chunk_text_sentence(text: str, max_chars: int = 240, split_oversized_sentences: bool = True) -> list[str]:
     """Sentence-ish splitter + length cap for a single text block."""
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
@@ -488,7 +488,7 @@ def _chunk_text_sentence(text: str, max_chars: int = 240) -> list[str]:
         if not p:
             continue
 
-        if len(p) > max_chars:
+        if len(p) > max_chars and split_oversized_sentences:
             if buf:
                 flush()
             for i in range(0, len(p), max_chars):
@@ -514,6 +514,38 @@ def _chunk_text_sentence(text: str, max_chars: int = 240) -> list[str]:
     return merged
 
 
+def _split_numbered_bullets(text: str) -> list[str]:
+    """Split numbered-bullet text into items, preserving wrapped continuation lines."""
+    lines = [line.rstrip() for line in (text or "").splitlines()]
+    bullet_re = re.compile(r"^\s*\d+[\.)]\s+")
+
+    items: list[str] = []
+    current: list[str] = []
+    saw_bullet = False
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        if bullet_re.match(line):
+            saw_bullet = True
+            if current:
+                items.append(" ".join(current).strip())
+            current = [line]
+            continue
+
+        if current:
+            current.append(line)
+        else:
+            # Leading non-bullet text: not a numbered list block.
+            return []
+
+    if current:
+        items.append(" ".join(current).strip())
+
+    return items if saw_bullet and len(items) > 1 else []
+
+
 def _chunk_text(text: str, max_chars: int = 240, paragraph_aware: bool = True) -> list[str]:
     """Paragraph-first chunking with sentence fallback when paragraph exceeds max_chars."""
     if not paragraph_aware:
@@ -527,16 +559,52 @@ def _chunk_text(text: str, max_chars: int = 240, paragraph_aware: bool = True) -
     if not paragraphs:
         return _chunk_text_sentence(raw, max_chars=max_chars)
 
-    out: list[str] = []
+    # lock=True means this unit should remain its own chunk (used for numbered bullets).
+    units: list[tuple[str, bool]] = []
     for para in paragraphs:
+        bullet_items = _split_numbered_bullets(para)
+        if bullet_items:
+            for item in bullet_items:
+                item_inline = re.sub(r"\s+", " ", item).strip()
+                if not item_inline:
+                    continue
+                if len(item_inline) <= max_chars:
+                    units.append((item_inline, True))
+                else:
+                    units.extend((c, True) for c in _chunk_text_sentence(item_inline, max_chars=max_chars, split_oversized_sentences=False))
+            continue
+
         para_inline = re.sub(r"\s+", " ", para).strip()
         if not para_inline:
             continue
         if len(para_inline) <= max_chars:
-            out.append(para_inline)
+            units.append((para_inline, False))
         else:
-            out.extend(_chunk_text_sentence(para_inline, max_chars=max_chars))
+            units.extend((c, False) for c in _chunk_text_sentence(para_inline, max_chars=max_chars, split_oversized_sentences=False))
 
+    out: list[str] = []
+    buf = ""
+
+    def flush_buf() -> None:
+        nonlocal buf
+        if buf:
+            out.append(buf)
+            buf = ""
+
+    for chunk, locked in units:
+        if locked:
+            flush_buf()
+            out.append(chunk)
+            continue
+
+        candidate = (buf + " " + chunk).strip() if buf else chunk
+        if len(candidate) <= max_chars:
+            buf = candidate
+        else:
+            flush_buf()
+            buf = chunk
+
+    flush_buf()
     return out
 
 
@@ -577,8 +645,8 @@ def _normalize_text_for_tts(text: str) -> str:
             return raw
 
     normalized = re.sub(r"\d+", _replace_number, text)
-    # Keep letters/numbers/whitespace and sentence punctuation used by chunking.
-    normalized = re.sub(r"[^A-Za-z0-9\s\.!\?]", " ", normalized)
+    # Keep letters/numbers/whitespace and sentence punctuation used by chunking (including commas).
+    normalized = re.sub(r"[^A-Za-z0-9\s,\.!\?]", " ", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return normalized
 
