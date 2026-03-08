@@ -90,6 +90,24 @@ if not torch.cuda.is_available():
 REQUESTED_CUDA_DEVICE = os.environ.get("QWEN_CUDA_DEVICE", "auto").strip().lower()
 
 
+
+
+def _visible_cuda_devices() -> list[dict]:
+    devices = []
+    if not torch.cuda.is_available():
+        return devices
+    for idx in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(idx)
+        devices.append(
+            {
+                "index": idx,
+                "name": props.name,
+                "total_memory_gb": round(float(props.total_memory) / (1024 ** 3), 2),
+            }
+        )
+    return devices
+
+
 def _resolve_cuda_device() -> str:
     count = torch.cuda.device_count()
     if count <= 0:
@@ -124,6 +142,7 @@ DEVICE = _resolve_cuda_device()
 CUDA_DEVICE_INDEX = int(DEVICE.split(":", 1)[1])
 torch.cuda.set_device(CUDA_DEVICE_INDEX)
 CUDA_DEVICE_NAME = torch.cuda.get_device_name(CUDA_DEVICE_INDEX)
+VISIBLE_CUDA_DEVICES = _visible_cuda_devices()
 
 
 # Legacy toggle retained for backward compatibility with existing env setups.
@@ -286,7 +305,7 @@ def force_greedy_recursive(root, label: str):
 
 if RAW_MODEL_ID.strip() and RAW_MODEL_ID.strip() != MODEL_ID:
     status(f"startup: remapped model alias '{RAW_MODEL_ID}' -> '{MODEL_ID}'")
-status(f"startup: loading model={MODEL_ID} device={DEVICE} device_name={CUDA_DEVICE_NAME} requested_cuda_device={REQUESTED_CUDA_DEVICE or 'auto'} dtype={_dtype_name(DTYPE)}")
+status(f"startup: loading model={MODEL_ID} device={DEVICE} device_name={CUDA_DEVICE_NAME} requested_cuda_device={REQUESTED_CUDA_DEVICE or 'auto'} visible_cuda_devices={VISIBLE_CUDA_DEVICES} dtype={_dtype_name(DTYPE)}")
 try:
     model = Qwen3TTSModel.from_pretrained(MODEL_ID, device_map=DEVICE, dtype=DTYPE)
 except OSError as e:
@@ -574,6 +593,7 @@ def health():
         "dtype": _dtype_name(DTYPE),
         "requested_dtype": REQUESTED_DTYPE,
         "cuda_bf16_available": CUDA_BF16_AVAILABLE,
+        "visible_cuda_devices": VISIBLE_CUDA_DEVICES,
         "queue_depth": play_q.qsize(),
         "supported_speakers": len(SUPPORTED_SPEAKERS),
         "supported_languages": len(SUPPORTED_LANGS),
