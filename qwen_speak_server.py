@@ -25,16 +25,19 @@ Env overrides:
   QWEN_AUTOMIX_FP32   default: 0  (kept for compatibility; model dtype defaults to fp32 anyway)
   QWEN_FORCE_FP32     default: 1  (set 0 to try fp16 again)
   QWEN_PLAY_Q_MAX     default: 100
+  QWEN_WAV_ENCODER_THREADS default: 2 (CPU pool for WAV encoding)
+  QWEN_GPU_SYNTH_CONCURRENCY default: 1 (max concurrent synth calls; can increase activation memory)
+  QWEN_FP16_RETRY_FP32 default: 1 (retry failed fp16 synth in fp32 autocast-off mode)
 
 Deps (WSL):
   sudo apt-get install -y ffmpeg sox libsox-fmt-all
   pip install fastapi uvicorn soundfile numpy torch qwen-tts
 """
 import io
+import concurrent.futures
 import inspect
 import os
 import re
-import tempfile
 import subprocess
 import threading
 import time
@@ -72,6 +75,7 @@ else:
 
 # Optional: compute in fp32 while keeping fp16 weights (extra stability) - mostly irrelevant if DTYPE=fp32
 AUTOMIX_FP32 = os.environ.get("QWEN_AUTOMIX_FP32", "0").strip() in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
+FP16_RETRY_FP32 = os.environ.get("QWEN_FP16_RETRY_FP32", "1").strip() in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
 
 # Allow TF32 (helps newer GPUs; harmless on most)
 if torch.cuda.is_available():
@@ -103,6 +107,10 @@ GEN_KWARGS = {
 }
 
 PRINT_PREFIX = "[qwen-speak]"
+
+GPU_SYNTH_CONCURRENCY = max(1, int(os.environ.get("QWEN_GPU_SYNTH_CONCURRENCY", "1")))
+# Caps concurrent model inference calls per worker (primarily affects concurrent HTTP requests).
+GPU_SYNTH_SEMAPHORE = threading.BoundedSemaphore(value=GPU_SYNTH_CONCURRENCY)
 
 app = FastAPI()
 
@@ -380,7 +388,7 @@ except Exception:
     SUPPORTED_SPEAKERS = []
 
 status(
-    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'}"
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'}"
 )
 
 
@@ -514,7 +522,33 @@ def _normalize_text_for_tts(text: str) -> str:
     return normalized
 
 
-def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: str) -> Tuple[bytes, int]:
+def _is_fp16_sampling_error(err: RuntimeError) -> bool:
+    msg = str(err).lower()
+    return ("probability tensor contains" in msg) or ("nan" in msg) or ("inf" in msg)
+
+
+def _run_generation_with_fp16_retry(gen_fn, kwargs: dict, label: str):
+    with torch.inference_mode():
+        try:
+            if DEVICE.startswith("cuda") and AUTOMIX_FP32 and DTYPE == torch.float16:
+                with torch.autocast(device_type="cuda", dtype=torch.float32, enabled=True):
+                    return gen_fn(**kwargs)
+            return gen_fn(**kwargs)
+        except RuntimeError as err:
+            should_retry = DEVICE.startswith("cuda") and DTYPE == torch.float16 and FP16_RETRY_FP32 and _is_fp16_sampling_error(err)
+            if not should_retry:
+                raise
+
+            status(f"speak: {label} fp16 instability detected; retrying once with fp32-safe path")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            with torch.autocast(device_type="cuda", enabled=False):
+                return gen_fn(**kwargs)
+
+
+
+
+def _synthesize_to_audio(text: str, speaker: str, language: str, instruct: str) -> Tuple[np.ndarray, int]:
     current_dev = _ensure_model_cuda()
     use_voice_clone_api = bool(VOICE_CLONE_KWARGS) and _HAS_GEN_VOICE_CLONE
     is_cloned_voice = use_voice_clone_api or bool(TRAINING_VOICE_KWARGS)
@@ -535,21 +569,18 @@ def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: s
         sent_ref_keys = [k for k in clone_kwargs if k in VOICE_CLONE_KWARGS]
         status(f"speak: using generate_voice_clone ref args={sorted(sent_ref_keys)}")
 
-        with torch.inference_mode():
-            if DEVICE.startswith("cuda") and AUTOMIX_FP32 and DTYPE == torch.float16:
-                with torch.autocast(device_type="cuda", dtype=torch.float32, enabled=True):
-                    audio_list, sr = model.generate_voice_clone(**clone_kwargs)
-            else:
-                audio_list, sr = model.generate_voice_clone(**clone_kwargs)
+        audio_list, sr = _run_generation_with_fp16_retry(
+            model.generate_voice_clone,
+            clone_kwargs,
+            label="generate_voice_clone",
+        )
 
         wav = _concat_audio(audio_list)
         if wav.size == 0:
             raise RuntimeError("Empty audio output from model")
 
-        buf = io.BytesIO()
-        sf.write(buf, wav, int(sr), format="WAV")
         status(f"speak: cloning voice finished sr={int(sr)} samples={wav.size}")
-        return buf.getvalue(), int(sr)
+        return wav, int(sr)
 
     call_kwargs = {
         "text": text,
@@ -589,21 +620,24 @@ def _synthesize_to_wav_bytes(text: str, speaker: str, language: str, instruct: s
     prompt_keys_sent = [k for k in call_kwargs if k in TRAINING_VOICE_KWARGS]
     status(f"speak: voice prompt args in call={sorted(prompt_keys_sent)}")
 
-    with torch.inference_mode():
-        if DEVICE.startswith("cuda") and AUTOMIX_FP32 and DTYPE == torch.float16:
-            with torch.autocast(device_type="cuda", dtype=torch.float32, enabled=True):
-                audio_list, sr = model.generate_custom_voice(**call_kwargs)
-        else:
-            audio_list, sr = model.generate_custom_voice(**call_kwargs)
+    audio_list, sr = _run_generation_with_fp16_retry(
+        model.generate_custom_voice,
+        call_kwargs,
+        label="generate_custom_voice",
+    )
 
     wav = _concat_audio(audio_list)
     if wav.size == 0:
         raise RuntimeError("Empty audio output from model")
 
+    status(f"speak: cloning voice finished sr={int(sr)} samples={wav.size}")
+    return wav, int(sr)
+
+
+def _encode_wav_bytes(wav: np.ndarray, sr: int) -> bytes:
     buf = io.BytesIO()
     sf.write(buf, wav, int(sr), format="WAV")
-    status(f"speak: cloning voice finished sr={int(sr)} samples={wav.size}")
-    return buf.getvalue(), int(sr)
+    return buf.getvalue()
 
 
 def _concat_wav_bytes(wav_chunks: list[bytes]) -> Tuple[bytes, int]:
@@ -648,20 +682,12 @@ _worker_stop = threading.Event()
 
 
 def _play_wav_bytes(wav_bytes: bytes) -> None:
-    # Write to temp .wav and play via ffplay
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
-        f.write(wav_bytes)
-        path = f.name
-    try:
-        subprocess.run(
-            ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path],
-            check=False,
-        )
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+    # Stream wav bytes directly to ffplay stdin (avoids temp-file churn).
+    subprocess.run(
+        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"],
+        input=wav_bytes,
+        check=False,
+    )
 
 
 def _worker_loop():
@@ -682,9 +708,12 @@ _worker_thread = threading.Thread(target=_worker_loop, daemon=True)
 _worker_thread.start()
 
 
+ENCODER_POOL_SIZE = int(os.environ.get("QWEN_WAV_ENCODER_THREADS", "2"))
+encode_pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, ENCODER_POOL_SIZE))
 @app.on_event("shutdown")
 def _shutdown():
     _worker_stop.set()
+    encode_pool.shutdown(wait=False, cancel_futures=True)
 
 
 # ----------------------------
@@ -721,23 +750,51 @@ def speak(
 
     job_ids = []
     audio_chunks: list[bytes] = []
+    first_chunk_latency_seconds: Optional[float] = None
+    first_word_latency_seconds: Optional[float] = None
+
+    def _finalize_chunk(chunk_idx: int, wav_bytes: bytes) -> None:
+        jid = f"{os.getpid()}-{threading.get_ident()}-{chunk_idx}"
+        job_ids.append(jid)
+
+        if play:
+            try:
+                play_q.put_nowait(SpeakJob(wav_bytes=wav_bytes, job_id=jid))
+                status(f"speak: queued playback job={jid} depth={play_q.qsize()}")
+            except queue.Full:
+                raise HTTPException(status_code=429, detail="Playback queue is full")
+
+        if return_audio:
+            audio_chunks.append(wav_bytes)
 
     try:
+        previous_encode: Optional[Tuple[int, concurrent.futures.Future[bytes]]] = None
+
         for idx, part in enumerate(parts):
             status(f"speak: processing chunk {idx + 1}/{len(parts)}")
-            wav_bytes, _sr = _synthesize_to_wav_bytes(part, speaker, language, instruct)
-            jid = f"{os.getpid()}-{threading.get_ident()}-{idx}"
-            job_ids.append(jid)
 
-            if play:
-                try:
-                    play_q.put_nowait(SpeakJob(wav_bytes=wav_bytes, job_id=jid))
-                    status(f"speak: queued playback job={jid} depth={play_q.qsize()}")
-                except queue.Full:
-                    raise HTTPException(status_code=429, detail="Playback queue is full")
+            GPU_SYNTH_SEMAPHORE.acquire()
+            try:
+                if idx == 0 and first_word_latency_seconds is None:
+                    # First-word proxy: when first chunk is about to enter model inference.
+                    first_word_latency_seconds = time.perf_counter() - request_start
+                wav, sr = _synthesize_to_audio(part, speaker, language, instruct)
+            finally:
+                GPU_SYNTH_SEMAPHORE.release()
 
-            if return_audio:
-                audio_chunks.append(wav_bytes)
+            if idx == 0 and first_chunk_latency_seconds is None:
+                # First-chunk proxy: when first synthesized chunk exits model inference.
+                first_chunk_latency_seconds = time.perf_counter() - request_start
+
+            if previous_encode is not None:
+                prev_idx, prev_future = previous_encode
+                _finalize_chunk(prev_idx, prev_future.result())
+
+            previous_encode = (idx, encode_pool.submit(_encode_wav_bytes, wav, sr))
+
+        if previous_encode is not None:
+            last_idx, last_future = previous_encode
+            _finalize_chunk(last_idx, last_future.result())
 
     except HTTPException:
         raise
@@ -746,7 +803,17 @@ def speak(
         raise HTTPException(status_code=500, detail=str(e))
 
     elapsed_seconds = time.perf_counter() - request_start
+    total_latency_seconds = elapsed_seconds
+    if first_word_latency_seconds is None:
+        first_word_latency_seconds = total_latency_seconds
+    if first_chunk_latency_seconds is None:
+        first_chunk_latency_seconds = total_latency_seconds
     completion_message = f"Request complete in {elapsed_seconds:.3f}s: {text}"
+    status(
+        f"speak: latency first_word={first_word_latency_seconds:.3f}s "
+        f"first_chunk={first_chunk_latency_seconds:.3f}s "
+        f"total={total_latency_seconds:.3f}s"
+    )
     status(completion_message)
 
     if return_audio and audio_chunks:
@@ -761,7 +828,9 @@ def speak(
                 "X-Qwen-SampleRate": str(merged_sr),
                 "X-Qwen-Chunks": str(len(parts)),
                 "X-Qwen-Chunked": "1" if chunk else "0",
-                "X-Qwen-Processing-Seconds": f"{elapsed_seconds:.3f}",
+                "X-Qwen-Latency-First-Word-Seconds": f"{first_word_latency_seconds:.3f}",
+                "X-Qwen-Latency-First-Chunk-Seconds": f"{first_chunk_latency_seconds:.3f}",
+                "X-Qwen-Processing-Seconds": f"{total_latency_seconds:.3f}",
             },
         )
 
@@ -769,7 +838,10 @@ def speak(
         "ok": True,
         "message": completion_message,
         "text": text,
-        "processing_seconds": round(elapsed_seconds, 3),
+        "processing_seconds": round(total_latency_seconds, 3),
+        "latency_to_first_word_seconds": round(first_word_latency_seconds, 3),
+        "latency_to_first_chunk_seconds": round(first_chunk_latency_seconds, 3),
+        "total_latency_seconds": round(total_latency_seconds, 3),
         "queued": bool(play),
         "return_audio": bool(return_audio),
         "chunked": bool(chunk),
