@@ -13,8 +13,8 @@ Qwen3-TTS local /speak server for AImaster (qwen-tts)
 - GET /languages
 - GET /health
 
-Designed for GTX 1080 stability:
-- Uses FP32 by default (prevents NaN/probability asserts seen with FP16 on Pascal)
+Designed for CUDA stability:
+- Defaults to bf16 on GPUs that support it; otherwise follows legacy fp32/fp16 behavior
 - Forces greedy decoding on internal HF components (best-effort)
 
 Env overrides:
@@ -22,12 +22,14 @@ Env overrides:
   QWEN_SPEAKER        default: ryan
   QWEN_LANG           default: english
   QWEN_INSTRUCT       default: "Read the text clearly, naturally, and conversationally."
-  QWEN_AUTOMIX_FP32   default: 0  (kept for compatibility; model dtype defaults to fp32 anyway)
-  QWEN_FORCE_FP32     default: 1  (set 0 to try fp16 again)
+  QWEN_DTYPE          default: auto (auto prefers bf16 on supported CUDA, otherwise follows legacy fp32/fp16 behavior)
+  QWEN_AUTOMIX_FP32   default: 0  (legacy; only applies when running fp16)
+  QWEN_FORCE_FP32     default: 1  (legacy fallback when QWEN_DTYPE=auto and bf16 unavailable)
   QWEN_PLAY_Q_MAX     default: 100
   QWEN_WAV_ENCODER_THREADS default: 2 (CPU pool for WAV encoding)
   QWEN_GPU_SYNTH_CONCURRENCY default: 1 (max concurrent synth calls; can increase activation memory)
   QWEN_FP16_RETRY_FP32 default: 1 (retry failed fp16 synth in fp32 autocast-off mode)
+  QWEN_FP16_PROMOTE_MODEL_BF16 default: 1 (on repeated fp16 NaN/Inf sampling, cast live model to bf16 and retry)
 
 Deps (WSL):
   sudo apt-get install -y ffmpeg sox libsox-fmt-all
@@ -69,16 +71,42 @@ if not torch.cuda.is_available():
     raise RuntimeError("CUDA not available, refusing CPU fallback")
 DEVICE = "cuda:0"
 
-# GTX 1080 stability: default to fp32 on CUDA; allow override if you upgrade GPU.
+# Legacy toggle retained for backward compatibility with existing env setups.
 FORCE_FP32 = os.environ.get("QWEN_FORCE_FP32", "1").strip() in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
-if DEVICE.startswith("cuda"):
-    DTYPE = torch.float32 if FORCE_FP32 else torch.float16
-else:
-    DTYPE = torch.float32
+REQUESTED_DTYPE = os.environ.get("QWEN_DTYPE", "auto").strip().lower()
+CUDA_BF16_AVAILABLE = bool(
+    torch.cuda.is_available() and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+)
 
-# Optional: compute in fp32 while keeping fp16 weights (extra stability) - mostly irrelevant if DTYPE=fp32
+
+def _resolve_requested_dtype() -> torch.dtype:
+    if not DEVICE.startswith("cuda"):
+        return torch.float32
+
+    if REQUESTED_DTYPE in ("bf16", "bfloat16"):
+        if not CUDA_BF16_AVAILABLE:
+            raise RuntimeError("QWEN_DTYPE=bf16 requested but CUDA bf16 is not supported on this GPU")
+        return torch.bfloat16
+    if REQUESTED_DTYPE in ("fp16", "float16", "half"):
+        return torch.float16
+    if REQUESTED_DTYPE in ("fp32", "float32"):
+        return torch.float32
+    if REQUESTED_DTYPE == "auto":
+        if CUDA_BF16_AVAILABLE:
+            return torch.bfloat16
+        return torch.float32 if FORCE_FP32 else torch.float16
+    raise RuntimeError(f"Unsupported QWEN_DTYPE value: {REQUESTED_DTYPE}")
+
+
+DTYPE = _resolve_requested_dtype()
+
+# Optional: compute in fp32 while keeping fp16 weights (extra stability) - only applies when DTYPE=fp16.
 AUTOMIX_FP32 = os.environ.get("QWEN_AUTOMIX_FP32", "0").strip() in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
 FP16_RETRY_FP32 = os.environ.get("QWEN_FP16_RETRY_FP32", "1").strip() in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
+FP16_PROMOTE_MODEL_BF16 = os.environ.get(
+    "QWEN_FP16_PROMOTE_MODEL_BF16",
+    os.environ.get("QWEN_FP16_PROMOTE_MODEL_FP32", "1"),
+).strip() in ("1", "true", "TRUE", "yes", "YES", "on", "ON")
 EMPTY_CACHE_EACH_CHUNK = os.environ.get("QWEN_CUDA_EMPTY_CACHE_EACH_CHUNK", "0").strip() in (
     "1", "true", "TRUE", "yes", "YES", "on", "ON"
 )
@@ -425,7 +453,7 @@ except Exception:
     SUPPORTED_SPEAKERS = []
 
 status(
-    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f}"
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} fp16_promote_bf16={'on' if FP16_PROMOTE_MODEL_BF16 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f}"
 )
 
 
@@ -657,6 +685,8 @@ def _is_fp16_sampling_error(err: RuntimeError) -> bool:
 
 
 def _run_generation_with_fp16_retry(gen_fn, kwargs: dict, label: str):
+    global DTYPE
+
     with torch.inference_mode():
         try:
             if DEVICE.startswith("cuda") and AUTOMIX_FP32 and DTYPE == torch.float16:
@@ -671,8 +701,40 @@ def _run_generation_with_fp16_retry(gen_fn, kwargs: dict, label: str):
             status(f"speak: {label} fp16 instability detected; retrying once with fp32-safe path")
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            with torch.autocast(device_type="cuda", enabled=False):
-                return gen_fn(**kwargs)
+
+            try:
+                with torch.autocast(device_type="cuda", enabled=False):
+                    return gen_fn(**kwargs)
+            except RuntimeError as retry_err:
+                can_promote_model = (
+                    DEVICE.startswith("cuda")
+                    and DTYPE == torch.float16
+                    and FP16_PROMOTE_MODEL_BF16
+                    and CUDA_BF16_AVAILABLE
+                    and _is_fp16_sampling_error(retry_err)
+                )
+                if not can_promote_model:
+                    raise
+
+                status(f"speak: {label} still unstable after autocast-off; promoting model weights to bf16")
+                try:
+                    if hasattr(model, "model") and model.model is not None:
+                        model.model = model.model.to(dtype=torch.bfloat16)
+                    if hasattr(model, "talker") and model.talker is not None:
+                        model.talker = model.talker.to(dtype=torch.bfloat16)
+                    if hasattr(model, "code_predictor") and model.code_predictor is not None:
+                        model.code_predictor = model.code_predictor.to(dtype=torch.bfloat16)
+                    DTYPE = torch.bfloat16
+                    force_greedy(model.model, "model.model")
+                    for sub_name in ("talker", "code_predictor"):
+                        if hasattr(model.model, sub_name):
+                            force_greedy(getattr(model.model, sub_name), f"model.model.{sub_name}")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    return gen_fn(**kwargs)
+                except Exception as promote_err:
+                    status(f"speak: {label} bf16 promotion failed ({promote_err}); raising original retry error")
+                    raise retry_err
 
 
 
