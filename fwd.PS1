@@ -3,7 +3,7 @@
 #  powershell.exe -ExecutionPolicy Bypass -File C:\Users\jonlo\fwd.PS1
 
 $ListenPort = 8765
-$ListenPort2 = 22
+$ListenPort2 = 5050 
 $WslDistro  = ""   # optional: set to a distro name like "Ubuntu-24.04" to target a specific distro
 
 function Get-WslIPv4 {
