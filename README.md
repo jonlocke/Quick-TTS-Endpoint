@@ -100,7 +100,7 @@ Backwards-compatible shortcuts:
 ./scripts/run.sh
 ```
 
-`./scripts/run.sh` maps host `8000` to container `8765` for older workflows.
+`./scripts/run.sh` maps host `8765` to container `8765` by default (override with `HOST_PORT`).
 
 Optional runtime overrides:
 

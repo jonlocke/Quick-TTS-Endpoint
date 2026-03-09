@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Backward-compatible wrapper used by prior automation/instructions.
-HOST_PORT="${HOST_PORT:-8000}"
+HOST_PORT="${HOST_PORT:-8765}"
 CONTAINER_NAME="${CONTAINER_NAME:-quick-tts-endpoint}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
