@@ -84,6 +84,7 @@ Optional build naming:
 ```bash
 IMAGE_NAME=my-qwen-tts IMAGE_TAG=dev ./scripts/docker-build.sh
 BASE_IMAGE=nvidia/cuda:12.6.0-runtime-ubuntu24.04 IMAGE_TAG=dev ./scripts/docker-build.sh
+TORCH_VERSION=2.3.1+cu118 TORCHVISION_VERSION=0.18.1+cu118 TORCHAUDIO_VERSION=2.3.1+cu118 ./scripts/docker-build.sh
 ```
 
 2. Run container with GPU access:

@@ -26,11 +26,15 @@ RUN python3 -m venv "$VIRTUAL_ENV" && \
 
 COPY . /app
 
+ARG TORCH_VERSION=2.2.2+cu118
+ARG TORCHVISION_VERSION=0.17.2+cu118
+ARG TORCHAUDIO_VERSION=2.2.2+cu118
+
 RUN python -m pip install --upgrade fastapi uvicorn soundfile "numpy<2" && \
     python -m pip install --upgrade \
-      torch==2.1.2+cu118 \
-      torchvision==0.16.2+cu118 \
-      torchaudio==2.1.2+cu118 \
+      "torch==${TORCH_VERSION}" \
+      "torchvision==${TORCHVISION_VERSION}" \
+      "torchaudio==${TORCHAUDIO_VERSION}" \
       --index-url https://download.pytorch.org/whl/cu118 && \
     python -m pip install --upgrade qwen-tts==0.1.0
 
