@@ -71,7 +71,7 @@ playback immediately:
 
 ## Docker workflow (NVIDIA Ubuntu Noble base)
 
-This repo now includes a GPU-ready container flow built on `nvidia/ubuntu:noble` (Ubuntu Noble):
+This repo now includes a GPU-ready container flow built on `nvcr.io/nvidia/ubuntu:24.04` (Ubuntu Noble):
 
 1. Build image:
 
@@ -83,7 +83,7 @@ Optional build naming:
 
 ```bash
 IMAGE_NAME=my-qwen-tts IMAGE_TAG=dev ./scripts/docker-build.sh
-BASE_IMAGE=nvidia/ubuntu:noble IMAGE_TAG=dev ./scripts/docker-build.sh
+BASE_IMAGE=nvcr.io/nvidia/ubuntu:24.04 IMAGE_TAG=dev ./scripts/docker-build.sh
 ```
 
 2. Run container with GPU access:
