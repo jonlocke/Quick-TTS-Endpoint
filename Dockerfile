@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1.6
-FROM nvidia/ubuntu:24.04
+ARG BASE_IMAGE=nvidia/ubuntu:noble
+FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
