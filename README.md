@@ -92,6 +92,15 @@ BASE_IMAGE=nvidia/cuda:12.6.0-runtime-ubuntu24.04 IMAGE_TAG=dev ./scripts/docker
 ./scripts/docker-run.sh
 ```
 
+Backwards-compatible shortcuts:
+
+```bash
+./scripts/build.sh
+./scripts/run.sh
+```
+
+`./scripts/run.sh` maps host `8000` to container `8765` for older workflows.
+
 Optional runtime overrides:
 
 ```bash
@@ -99,6 +108,7 @@ HOST_PORT=9000 IMAGE_TAG=dev ./scripts/docker-run.sh
 ```
 
 Notes:
+- `scripts/docker-run.sh` starts the container in detached mode and waits for `/health` to report ready.
 - `scripts/docker-run.sh` auto-mounts `train.wav` and `train.txt` when present in the repo root.
 - Requires Docker + NVIDIA Container Toolkit (`--gpus all`).
 - Service listens on container port `8765`.
