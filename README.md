@@ -68,3 +68,36 @@ playback immediately:
   paragraph is within `max_chars`; overlong paragraphs fall back to sentence chunking.
 
 `stream_audio_chunks=1` cannot be combined with `return_audio=1`.
+
+## Docker workflow (NVIDIA Ubuntu Noble base)
+
+This repo now includes a GPU-ready container flow built on `nvidia/ubuntu:24.04` (Ubuntu Noble):
+
+1. Build image:
+
+```bash
+./scripts/docker-build.sh
+```
+
+Optional build naming:
+
+```bash
+IMAGE_NAME=my-qwen-tts IMAGE_TAG=dev ./scripts/docker-build.sh
+```
+
+2. Run container with GPU access:
+
+```bash
+./scripts/docker-run.sh
+```
+
+Optional runtime overrides:
+
+```bash
+HOST_PORT=9000 IMAGE_TAG=dev ./scripts/docker-run.sh
+```
+
+Notes:
+- `scripts/docker-run.sh` auto-mounts `train.wav` and `train.txt` when present in the repo root.
+- Requires Docker + NVIDIA Container Toolkit (`--gpus all`).
+- Service listens on container port `8765`.
