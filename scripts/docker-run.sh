@@ -9,9 +9,9 @@ HEALTH_PATH="${HEALTH_PATH:-/health}"
 HEALTH_TIMEOUT_SEC="${HEALTH_TIMEOUT_SEC:-120}"
 
 # GPU flag control:
-# - auto (default): use --gpus all only when Docker reports an NVIDIA runtime.
+# - auto (default): require NVIDIA runtime and pass --gpus all.
 # - on: always force --gpus all.
-# - off: never pass --gpus.
+# - off: never pass --gpus (only for custom CPU-capable images).
 DOCKER_GPU_MODE="${DOCKER_GPU_MODE:-auto}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,13 +40,17 @@ case "$DOCKER_GPU_MODE" in
     ;;
   off)
     GPU_ARGS=()
+    echo "Warning: DOCKER_GPU_MODE=off disables GPU flags; default image may fail because server enforces CUDA." >&2
     ;;
   auto)
     if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -qi 'nvidia'; then
       GPU_ARGS=(--gpus all)
     else
-      echo "Warning: NVIDIA Docker runtime not detected; running without --gpus." >&2
-      echo "         Set DOCKER_GPU_MODE=on to force GPU, or DOCKER_GPU_MODE=off to silence this warning." >&2
+      echo "Error: NVIDIA Docker runtime not detected." >&2
+      echo "This image requires CUDA and will fail to start without GPU support." >&2
+      echo "Install/configure NVIDIA Container Toolkit, then retry." >&2
+      echo "If you are using a custom CPU-capable image, set DOCKER_GPU_MODE=off explicitly." >&2
+      exit 1
     fi
     ;;
   *)
