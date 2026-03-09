@@ -3,7 +3,7 @@ set -euo pipefail
 
 IMAGE_NAME="${IMAGE_NAME:-quick-tts-endpoint}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
-BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/ubuntu:24.04}"
+BASE_IMAGE="${BASE_IMAGE:-nvidia/cuda:12.6.0-runtime-ubuntu24.04}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"

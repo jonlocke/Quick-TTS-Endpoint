@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.6
-ARG BASE_IMAGE=nvcr.io/nvidia/ubuntu:24.04
+ARG BASE_IMAGE=nvidia/cuda:12.6.0-runtime-ubuntu24.04
 FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \

@@ -69,9 +69,9 @@ playback immediately:
 
 `stream_audio_chunks=1` cannot be combined with `return_audio=1`.
 
-## Docker workflow (NVIDIA Ubuntu Noble base)
+## Docker workflow (NVIDIA CUDA Ubuntu 24.04 base)
 
-This repo now includes a GPU-ready container flow built on `nvcr.io/nvidia/ubuntu:24.04` (Ubuntu Noble):
+This repo now includes a GPU-ready container flow built on `nvidia/cuda:12.6.0-runtime-ubuntu24.04`:
 
 1. Build image:
 
@@ -83,7 +83,7 @@ Optional build naming:
 
 ```bash
 IMAGE_NAME=my-qwen-tts IMAGE_TAG=dev ./scripts/docker-build.sh
-BASE_IMAGE=nvcr.io/nvidia/ubuntu:24.04 IMAGE_TAG=dev ./scripts/docker-build.sh
+BASE_IMAGE=nvidia/cuda:12.6.0-runtime-ubuntu24.04 IMAGE_TAG=dev ./scripts/docker-build.sh
 ```
 
 2. Run container with GPU access:
