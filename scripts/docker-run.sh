@@ -8,6 +8,12 @@ HOST_PORT="${HOST_PORT:-8765}"
 HEALTH_PATH="${HEALTH_PATH:-/health}"
 HEALTH_TIMEOUT_SEC="${HEALTH_TIMEOUT_SEC:-120}"
 
+# GPU flag control:
+# - auto (default): use --gpus all only when Docker reports an NVIDIA runtime.
+# - on: always force --gpus all.
+# - off: never pass --gpus.
+DOCKER_GPU_MODE="${DOCKER_GPU_MODE:-auto}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
@@ -27,6 +33,28 @@ if [[ -f "$TRAIN_TXT" ]]; then
   MOUNTS+=("-v" "${TRAIN_TXT}:/app/train.txt:ro" "-e" "QWEN_TRAIN_TXT=/app/train.txt")
 fi
 
+GPU_ARGS=()
+case "$DOCKER_GPU_MODE" in
+  on)
+    GPU_ARGS=(--gpus all)
+    ;;
+  off)
+    GPU_ARGS=()
+    ;;
+  auto)
+    if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -qi 'nvidia'; then
+      GPU_ARGS=(--gpus all)
+    else
+      echo "Warning: NVIDIA Docker runtime not detected; running without --gpus." >&2
+      echo "         Set DOCKER_GPU_MODE=on to force GPU, or DOCKER_GPU_MODE=off to silence this warning." >&2
+    fi
+    ;;
+  *)
+    echo "Error: invalid DOCKER_GPU_MODE='${DOCKER_GPU_MODE}'. Use: auto, on, or off." >&2
+    exit 1
+    ;;
+esac
+
 if docker ps -a --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
   echo "Removing existing container ${CONTAINER_NAME}"
   docker rm -f "$CONTAINER_NAME" >/dev/null
@@ -34,7 +62,7 @@ fi
 
 echo "Starting ${CONTAINER_NAME} on port ${HOST_PORT}"
 CONTAINER_ID="$(docker run -d \
-  --gpus all \
+  "${GPU_ARGS[@]}" \
   --name "$CONTAINER_NAME" \
   -p "${HOST_PORT}:8765" \
   "${MOUNTS[@]}" \

@@ -106,10 +106,12 @@ Optional runtime overrides:
 
 ```bash
 HOST_PORT=9000 IMAGE_TAG=dev ./scripts/docker-run.sh
+DOCKER_GPU_MODE=off ./scripts/docker-run.sh
 ```
 
 Notes:
 - `scripts/docker-run.sh` starts the container in detached mode and waits for `/health` to report ready.
 - `scripts/docker-run.sh` auto-mounts `train.wav` and `train.txt` when present in the repo root.
-- Requires Docker + NVIDIA Container Toolkit (`--gpus all`).
+- `DOCKER_GPU_MODE` controls GPU flags (`auto` default, `on`, `off`).
+- Use `DOCKER_GPU_MODE=off` on hosts without NVIDIA Docker runtime support to avoid `failed to discover GPU vendor` startup errors.
 - Service listens on container port `8765`.
