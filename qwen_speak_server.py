@@ -141,6 +141,7 @@ GEN_KWARGS = {
 PRINT_PREFIX = "[qwen-speak]"
 
 GPU_SYNTH_CONCURRENCY = max(1, int(os.environ.get("QWEN_GPU_SYNTH_CONCURRENCY", "1")))
+CHUNK_GEN_TIMEOUT_SECONDS = float(os.environ.get("QWEN_CHUNK_GEN_TIMEOUT_SECONDS", "150"))
 # Caps concurrent model inference calls per worker (primarily affects concurrent HTTP requests).
 GPU_SYNTH_SEMAPHORE = threading.BoundedSemaphore(value=GPU_SYNTH_CONCURRENCY)
 
@@ -460,7 +461,7 @@ except Exception:
     SUPPORTED_SPEAKERS = []
 
 status(
-    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f}"
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} chunk_gen_timeout_s={CHUNK_GEN_TIMEOUT_SECONDS:g} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f}"
 )
 
 
@@ -798,6 +799,22 @@ def _synthesize_to_audio(text: str, speaker: str, language: str, instruct: str) 
     return wav, int(sr)
 
 
+def _synthesize_to_audio_with_timeout(text: str, speaker: str, language: str, instruct: str) -> Tuple[np.ndarray, int]:
+    """Run chunk synthesis with a hard timeout bail-out."""
+    if CHUNK_GEN_TIMEOUT_SECONDS <= 0:
+        return _synthesize_to_audio(text, speaker, language, instruct)
+
+    future = synth_pool.submit(_synthesize_to_audio, text, speaker, language, instruct)
+    try:
+        return future.result(timeout=CHUNK_GEN_TIMEOUT_SECONDS)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise TimeoutError(
+            f"Chunk synthesis exceeded timeout of {CHUNK_GEN_TIMEOUT_SECONDS:.1f}s"
+        )
+
+
+
 def _maybe_compact_cuda_heap(stage: str) -> None:
     """
     Optional mitigation for perceived VRAM growth from the CUDA caching allocator.
@@ -915,10 +932,12 @@ _worker_thread.start()
 
 ENCODER_POOL_SIZE = int(os.environ.get("QWEN_WAV_ENCODER_THREADS", "2"))
 encode_pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, ENCODER_POOL_SIZE))
+synth_pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, GPU_SYNTH_CONCURRENCY))
 @app.on_event("shutdown")
 def _shutdown():
     _worker_stop.set()
     encode_pool.shutdown(wait=False, cancel_futures=True)
+    synth_pool.shutdown(wait=False, cancel_futures=True)
 
 
 # ----------------------------
@@ -994,7 +1013,7 @@ def speak(
                     try:
                         if idx == 0 and first_word_latency_seconds is None:
                             first_word_latency_seconds = time.perf_counter() - request_start
-                        wav, sr = _synthesize_to_audio(part, speaker, language, instruct)
+                        wav, sr = _synthesize_to_audio_with_timeout(part, speaker, language, instruct)
                     finally:
                         GPU_SYNTH_SEMAPHORE.release()
                         _maybe_compact_cuda_heap(stage="chunk")
@@ -1056,7 +1075,7 @@ def speak(
                 if idx == 0 and first_word_latency_seconds is None:
                     # First-word proxy: when first chunk is about to enter model inference.
                     first_word_latency_seconds = time.perf_counter() - request_start
-                wav, sr = _synthesize_to_audio(part, speaker, language, instruct)
+                wav, sr = _synthesize_to_audio_with_timeout(part, speaker, language, instruct)
             finally:
                 GPU_SYNTH_SEMAPHORE.release()
                 _maybe_compact_cuda_heap(stage="chunk")
@@ -1075,6 +1094,8 @@ def speak(
             last_idx, last_future = previous_encode
             _finalize_chunk(last_idx, last_future.result())
 
+    except TimeoutError as e:
+        raise HTTPException(status_code=504, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:

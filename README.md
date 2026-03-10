@@ -45,6 +45,8 @@ falls back to `generate_custom_voice(...)` compatibility logic.
 
 If you are benchmarking GPU inference, call `/speak` with `play=false` to avoid ffplay server-side playback CPU overhead.
 
+If a single synthesis chunk takes too long, the server now bails out by default after 150s (`QWEN_CHUNK_GEN_TIMEOUT_SECONDS`, i.e. 2:30). Set to `0` to disable.
+
 If `nvidia-smi` appears to show VRAM climbing chunk-by-chunk, tune cache compaction with `QWEN_CUDA_CACHE_CLEAR_POLICY`:
 
 - `off` (default): fastest, keep allocator cache for reuse
