@@ -60,6 +60,8 @@ When `generate_voice_clone(...)` and `create_voice_clone_prompt(...)` are both a
 
 Input normalization: `/speak` now converts integer digits to words (e.g. `3` -> `three`) and strips non-speech symbols before synthesis, while preserving punctuation cues like `, . ! ? : ;`.
 
+List formatting cue: if an input line starts as a bullet/numbered point (`-`, `*`, `•`, `1.`, `1)`), the server appends a trailing full stop when missing so speech cadence sounds natural.
+
 
 ## Low-latency chunk delivery to clients
 

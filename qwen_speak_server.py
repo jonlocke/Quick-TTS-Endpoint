@@ -550,6 +550,24 @@ def _chunk_text_sentence(text: str, max_chars: int = 240, split_oversized_senten
     return merged
 
 
+
+
+def _append_fullstop_to_list_lines(text: str) -> str:
+    """Ensure bullet/numbered lines end with punctuation for natural TTS pauses."""
+    lines = (text or "").splitlines()
+    out: list[str] = []
+    list_re = re.compile(r"^\s*(?:\d+[\.)]|[-*•])\s+")
+
+    for line in lines:
+        stripped = line.rstrip()
+        if list_re.match(stripped):
+            tail = stripped.rstrip()
+            if tail and tail[-1] not in ".!?;:":
+                stripped = f"{tail}."
+        out.append(stripped)
+
+    return "\n".join(out)
+
 def _split_numbered_bullets(text: str) -> list[str]:
     """Split numbered-bullet text into items, preserving wrapped continuation lines."""
     lines = [line.rstrip() for line in (text or "").splitlines()]
@@ -587,7 +605,7 @@ def _chunk_text(text: str, max_chars: int = 240, paragraph_aware: bool = True) -
     if not paragraph_aware:
         return _chunk_text_sentence(text, max_chars=max_chars)
 
-    raw = (text or "").strip()
+    raw = _append_fullstop_to_list_lines((text or "")).strip()
     if not raw:
         return []
 
