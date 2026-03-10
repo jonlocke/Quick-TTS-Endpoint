@@ -9,8 +9,9 @@ HEALTH_PATH="${HEALTH_PATH:-/health}"
 HEALTH_TIMEOUT_SEC="${HEALTH_TIMEOUT_SEC:-120}"
 
 PERSIST_MODEL_CACHE="${PERSIST_MODEL_CACHE:-1}"
-MODEL_CACHE_VOLUME="${MODEL_CACHE_VOLUME:-quick-tts-hf-cache}"
+MODEL_CACHE_HOST_DIR="${MODEL_CACHE_HOST_DIR:-}"
 HUGGINGFACE_CACHE_DIR="${HUGGINGFACE_CACHE_DIR:-/root/.cache/huggingface}"
+RESTART_POLICY="${RESTART_POLICY:-unless-stopped}"
 
 # GPU flag control:
 # - auto (default): require NVIDIA runtime and pass --gpus all.
@@ -20,6 +21,10 @@ DOCKER_GPU_MODE="${DOCKER_GPU_MODE:-auto}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+if [[ "${MODEL_CACHE_HOST_DIR:-}" == "" || "${MODEL_CACHE_HOST_DIR}" == "${REPO_ROOT:-.}/.hf-cache" ]]; then
+  MODEL_CACHE_HOST_DIR="${REPO_ROOT}/.hf-cache"
+fi
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "Error: docker is not installed or not in PATH." >&2
@@ -44,7 +49,8 @@ if [[ "${PERSIST_MODEL_CACHE}" != "0" && "${PERSIST_MODEL_CACHE}" != "1" ]]; the
 fi
 
 if [[ "${PERSIST_MODEL_CACHE}" == "1" ]]; then
-  MOUNTS+=("-v" "${MODEL_CACHE_VOLUME}:${HUGGINGFACE_CACHE_DIR}")
+  mkdir -p "${MODEL_CACHE_HOST_DIR}"
+  MOUNTS+=("-v" "${MODEL_CACHE_HOST_DIR}:${HUGGINGFACE_CACHE_DIR}")
 fi
 
 GPU_ARGS=()
@@ -79,12 +85,14 @@ if docker ps -a --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
 fi
 
 echo "Starting ${CONTAINER_NAME} on port ${HOST_PORT}"
+echo "Restart policy: ${RESTART_POLICY}"
 if [[ "${PERSIST_MODEL_CACHE}" == "1" ]]; then
-  echo "Persistent model cache volume: ${MODEL_CACHE_VOLUME} -> ${HUGGINGFACE_CACHE_DIR}"
+  echo "Persistent model cache bind mount: ${MODEL_CACHE_HOST_DIR} -> ${HUGGINGFACE_CACHE_DIR}"
 fi
 CONTAINER_ID="$(docker run -d \
   "${GPU_ARGS[@]}" \
   --name "$CONTAINER_NAME" \
+  --restart "${RESTART_POLICY}" \
   -p "${HOST_PORT}:8765" \
   "${MOUNTS[@]}" \
   -e QWEN_GPU_SYNTH_CONCURRENCY="${QWEN_GPU_SYNTH_CONCURRENCY:-1}" \
