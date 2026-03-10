@@ -58,7 +58,7 @@ If `nvidia-smi` appears to show VRAM climbing chunk-by-chunk, tune cache compact
 
 When `generate_voice_clone(...)` and `create_voice_clone_prompt(...)` are both available in your installed `qwen-tts`, the server now builds the reference prompt once at startup and reuses it via `voice_clone_prompt` for subsequent generations.
 
-Input normalization: `/speak` now converts integer digits to words (e.g. `3` -> `three`) and strips non-speech symbols before synthesis.
+Input normalization: `/speak` now converts integer digits to words (e.g. `3` -> `three`) and strips non-speech symbols before synthesis, while preserving punctuation cues like `, . ! ? : ;`.
 
 
 ## Low-latency chunk delivery to clients
