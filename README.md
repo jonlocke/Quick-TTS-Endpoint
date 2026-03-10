@@ -139,6 +139,7 @@ PERSIST_MODEL_CACHE=1 MODEL_CACHE_VOLUME=quick-tts-hf-cache ./scripts/docker-run
 Notes:
 - `scripts/docker-run.sh` starts the container in detached mode and waits for `/health` to report ready.
 - `scripts/docker-run.sh` auto-mounts training files only when **both** `train.wav` and `train.txt` are present in the repo root.
+- The Dockerfile `CMD` only starts `uvicorn`; mounts must be provided at container run time (for example via `scripts/docker-run.sh` / `scripts/run.sh` or explicit `docker run -v ...`).
 - Model cache is persisted by default using Docker volume `quick-tts-hf-cache` mounted at `/root/.cache/huggingface`.
 - Configure cache persistence with `PERSIST_MODEL_CACHE` (`1` default) and `MODEL_CACHE_VOLUME`.
 - `DOCKER_GPU_MODE` controls GPU flags (`auto` default, `on`, `off`).
