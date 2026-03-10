@@ -69,6 +69,28 @@ playback immediately:
 
 `stream_audio_chunks=1` cannot be combined with `return_audio=1`.
 
+
+## NVIDIA Container Toolkit install (manual)
+
+If Docker is installed but `docker info --format '{{json .Runtimes}}'` does not show `nvidia`, install/configure toolkit:
+
+```bash
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+docker info --format '{{json .Runtimes}}' | grep -i nvidia
+```
+
+You can also run the helper script:
+
+```bash
+./scripts/deps.sh
+```
+
+Set `INSTALL_TOOLKIT=0` to skip toolkit changes and only install Python/system deps.
+
 ## Docker workflow (NVIDIA CUDA Ubuntu 24.04 base)
 
 This repo now includes a GPU-ready container flow built on `nvidia/cuda:12.6.0-runtime-ubuntu24.04`:
