@@ -30,11 +30,12 @@ TRAIN_WAV="${QWEN_TRAIN_WAV:-${REPO_ROOT}/train.wav}"
 TRAIN_TXT="${QWEN_TRAIN_TXT:-${REPO_ROOT}/train.txt}"
 
 MOUNTS=()
-if [[ -f "$TRAIN_WAV" ]]; then
+if [[ -f "$TRAIN_WAV" && -f "$TRAIN_TXT" ]]; then
   MOUNTS+=("-v" "${TRAIN_WAV}:/app/train.wav:ro" "-e" "QWEN_TRAIN_WAV=/app/train.wav")
-fi
-if [[ -f "$TRAIN_TXT" ]]; then
   MOUNTS+=("-v" "${TRAIN_TXT}:/app/train.txt:ro" "-e" "QWEN_TRAIN_TXT=/app/train.txt")
+elif [[ -f "$TRAIN_WAV" || -f "$TRAIN_TXT" ]]; then
+  echo "Warning: partial training prompt files detected; both train.wav and train.txt are required to enable clone prompt." >&2
+  echo "         Continuing without training prompt mounts." >&2
 fi
 
 if [[ "${PERSIST_MODEL_CACHE}" != "0" && "${PERSIST_MODEL_CACHE}" != "1" ]]; then
@@ -92,7 +93,6 @@ CONTAINER_ID="$(docker run -d \
   -e QWEN_CUDA_CACHE_PRESSURE_THRESHOLD="${QWEN_CUDA_CACHE_PRESSURE_THRESHOLD:-0.98}" \
   -e HF_HOME="${HUGGINGFACE_CACHE_DIR}" \
   -e HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_CACHE_DIR}" \
-  -e TRANSFORMERS_CACHE="${HUGGINGFACE_CACHE_DIR}" \
   "${IMAGE_NAME}:${IMAGE_TAG}")"
 
 echo "Container started successfully: ${CONTAINER_NAME} (${CONTAINER_ID})"

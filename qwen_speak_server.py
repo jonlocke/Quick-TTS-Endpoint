@@ -128,6 +128,7 @@ ALLOW_SPEAKER_WITH_TRAIN = os.environ.get("QWEN_ALLOW_SPEAKER_WITH_TRAIN", "0").
 FORCE_CUSTOM_SPEAKER = os.environ.get("QWEN_FORCE_CUSTOM_SPEAKER", "custom").strip()
 PROMPT_AUDIO_ARG_OVERRIDE = os.environ.get("QWEN_PROMPT_AUDIO_ARG", "").strip()
 PROMPT_TEXT_ARG_OVERRIDE = os.environ.get("QWEN_PROMPT_TEXT_ARG", "").strip()
+REQUIRE_TRAINING_FILES = os.environ.get("QWEN_REQUIRE_TRAINING_FILES", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # Generation kwargs (best effort; still force greedy via generation_config)
 GEN_KWARGS = {
@@ -422,8 +423,21 @@ def _build_voice_clone_kwargs() -> dict:
     return kwargs
 
 
-TRAINING_VOICE_KWARGS = _build_training_voice_kwargs()
-VOICE_CLONE_KWARGS = _build_voice_clone_kwargs()
+try:
+    TRAINING_VOICE_KWARGS = _build_training_voice_kwargs()
+except FileNotFoundError as e:
+    if REQUIRE_TRAINING_FILES:
+        raise
+    status(f"startup: training voice prompt files not found; continuing without clone prompt ({e})")
+    TRAINING_VOICE_KWARGS = {}
+
+try:
+    VOICE_CLONE_KWARGS = _build_voice_clone_kwargs()
+except FileNotFoundError as e:
+    if REQUIRE_TRAINING_FILES:
+        raise
+    status(f"startup: voice clone reference files not found; continuing without clone refs ({e})")
+    VOICE_CLONE_KWARGS = {}
 
 # Force greedy decoding on internal components (critical for stability)
 try:

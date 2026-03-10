@@ -26,6 +26,9 @@ You can override paths with:
 - `QWEN_TRAIN_WAV`
 - `QWEN_TRAIN_TXT`
 
+If training files are missing, startup now continues without voice-clone prompt inputs.
+Set `QWEN_REQUIRE_TRAINING_FILES=1` to make missing files a hard startup error.
+
 When training prompt files are present, the server defaults to clone-first behavior
 instead of a fixed built-in speaker. Optional tuning:
 
@@ -135,7 +138,7 @@ PERSIST_MODEL_CACHE=1 MODEL_CACHE_VOLUME=quick-tts-hf-cache ./scripts/docker-run
 
 Notes:
 - `scripts/docker-run.sh` starts the container in detached mode and waits for `/health` to report ready.
-- `scripts/docker-run.sh` auto-mounts `train.wav` and `train.txt` when present in the repo root.
+- `scripts/docker-run.sh` auto-mounts training files only when **both** `train.wav` and `train.txt` are present in the repo root.
 - Model cache is persisted by default using Docker volume `quick-tts-hf-cache` mounted at `/root/.cache/huggingface`.
 - Configure cache persistence with `PERSIST_MODEL_CACHE` (`1` default) and `MODEL_CACHE_VOLUME`.
 - `DOCKER_GPU_MODE` controls GPU flags (`auto` default, `on`, `off`).
