@@ -8,6 +8,10 @@ HOST_PORT="${HOST_PORT:-8765}"
 HEALTH_PATH="${HEALTH_PATH:-/health}"
 HEALTH_TIMEOUT_SEC="${HEALTH_TIMEOUT_SEC:-120}"
 
+PERSIST_MODEL_CACHE="${PERSIST_MODEL_CACHE:-1}"
+MODEL_CACHE_VOLUME="${MODEL_CACHE_VOLUME:-quick-tts-hf-cache}"
+HUGGINGFACE_CACHE_DIR="${HUGGINGFACE_CACHE_DIR:-/root/.cache/huggingface}"
+
 # GPU flag control:
 # - auto (default): require NVIDIA runtime and pass --gpus all.
 # - on: always force --gpus all.
@@ -31,6 +35,15 @@ if [[ -f "$TRAIN_WAV" ]]; then
 fi
 if [[ -f "$TRAIN_TXT" ]]; then
   MOUNTS+=("-v" "${TRAIN_TXT}:/app/train.txt:ro" "-e" "QWEN_TRAIN_TXT=/app/train.txt")
+fi
+
+if [[ "${PERSIST_MODEL_CACHE}" != "0" && "${PERSIST_MODEL_CACHE}" != "1" ]]; then
+  echo "Error: invalid PERSIST_MODEL_CACHE='${PERSIST_MODEL_CACHE}'. Use: 0 or 1." >&2
+  exit 1
+fi
+
+if [[ "${PERSIST_MODEL_CACHE}" == "1" ]]; then
+  MOUNTS+=("-v" "${MODEL_CACHE_VOLUME}:${HUGGINGFACE_CACHE_DIR}")
 fi
 
 GPU_ARGS=()
@@ -65,6 +78,9 @@ if docker ps -a --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
 fi
 
 echo "Starting ${CONTAINER_NAME} on port ${HOST_PORT}"
+if [[ "${PERSIST_MODEL_CACHE}" == "1" ]]; then
+  echo "Persistent model cache volume: ${MODEL_CACHE_VOLUME} -> ${HUGGINGFACE_CACHE_DIR}"
+fi
 CONTAINER_ID="$(docker run -d \
   "${GPU_ARGS[@]}" \
   --name "$CONTAINER_NAME" \
@@ -74,6 +90,9 @@ CONTAINER_ID="$(docker run -d \
   -e QWEN_FORCE_FP32="${QWEN_FORCE_FP32:-1}" \
   -e QWEN_CUDA_CACHE_CLEAR_POLICY="${QWEN_CUDA_CACHE_CLEAR_POLICY:-pressure}" \
   -e QWEN_CUDA_CACHE_PRESSURE_THRESHOLD="${QWEN_CUDA_CACHE_PRESSURE_THRESHOLD:-0.98}" \
+  -e HF_HOME="${HUGGINGFACE_CACHE_DIR}" \
+  -e HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_CACHE_DIR}" \
+  -e TRANSFORMERS_CACHE="${HUGGINGFACE_CACHE_DIR}" \
   "${IMAGE_NAME}:${IMAGE_TAG}")"
 
 echo "Container started successfully: ${CONTAINER_NAME} (${CONTAINER_ID})"

@@ -130,11 +130,14 @@ Optional runtime overrides:
 HOST_PORT=9000 IMAGE_TAG=dev ./scripts/docker-run.sh
 DOCKER_GPU_MODE=on ./scripts/docker-run.sh
 DOCKER_GPU_MODE=off ./scripts/docker-run.sh  # only for custom CPU-capable images
+PERSIST_MODEL_CACHE=1 MODEL_CACHE_VOLUME=quick-tts-hf-cache ./scripts/docker-run.sh
 ```
 
 Notes:
 - `scripts/docker-run.sh` starts the container in detached mode and waits for `/health` to report ready.
 - `scripts/docker-run.sh` auto-mounts `train.wav` and `train.txt` when present in the repo root.
+- Model cache is persisted by default using Docker volume `quick-tts-hf-cache` mounted at `/root/.cache/huggingface`.
+- Configure cache persistence with `PERSIST_MODEL_CACHE` (`1` default) and `MODEL_CACHE_VOLUME`.
 - `DOCKER_GPU_MODE` controls GPU flags (`auto` default, `on`, `off`).
 - Default `auto` now fails fast if NVIDIA Docker runtime is missing (instead of starting and then crashing).
 - `DOCKER_GPU_MODE=off` is only for custom CPU-capable images; this repo's default server enforces CUDA at startup.
