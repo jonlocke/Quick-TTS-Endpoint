@@ -73,6 +73,20 @@ playback immediately:
 `stream_audio_chunks=1` cannot be combined with `return_audio=1`.
 
 
+## Prepare training audio (normalize to `train.wav`)
+
+Use the helper script to normalize a source wav into training format:
+
+```bash
+./scripts/normalize-training-wav.sh <input-wav-or-basepath> [output-wav]
+```
+
+Example (your requested ffmpeg chain, outputting `train.wav`):
+
+```bash
+./scripts/normalize-training-wav.sh my_voice.wav train.wav
+```
+
 ## NVIDIA Container Toolkit install (manual)
 
 If Docker is installed but `docker info --format '{{json .Runtimes}}'` does not show `nvidia`, install/configure toolkit:
