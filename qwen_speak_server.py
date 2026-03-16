@@ -142,6 +142,9 @@ PRINT_PREFIX = "[qwen-speak]"
 
 GPU_SYNTH_CONCURRENCY = max(1, int(os.environ.get("QWEN_GPU_SYNTH_CONCURRENCY", "1")))
 CHUNK_GEN_TIMEOUT_SECONDS = float(os.environ.get("QWEN_CHUNK_GEN_TIMEOUT_SECONDS", "150"))
+# Admission control: how long a request waits for a synth slot before fast-failing busy.
+SYNTH_ACQUIRE_TIMEOUT_SECONDS = float(os.environ.get("QWEN_SYNTH_ACQUIRE_TIMEOUT_SECONDS", "0.25"))
+SYNTH_BUSY_STATUS_CODE = int(os.environ.get("QWEN_SYNTH_BUSY_STATUS_CODE", "429"))
 # Caps concurrent model inference calls per worker (primarily affects concurrent HTTP requests).
 GPU_SYNTH_SEMAPHORE = threading.BoundedSemaphore(value=GPU_SYNTH_CONCURRENCY)
 
@@ -157,6 +160,19 @@ class SpeakReq(BaseModel):
 
 def status(step: str):
     print(f"{PRINT_PREFIX} {step}", flush=True)
+
+
+def _acquire_synth_slot_or_busy() -> None:
+    timeout = SYNTH_ACQUIRE_TIMEOUT_SECONDS
+    if timeout <= 0:
+        acquired = GPU_SYNTH_SEMAPHORE.acquire(blocking=False)
+    else:
+        acquired = GPU_SYNTH_SEMAPHORE.acquire(timeout=timeout)
+    if not acquired:
+        raise HTTPException(
+            status_code=SYNTH_BUSY_STATUS_CODE,
+            detail=f"TTS synth is busy; retry shortly (waited {max(timeout, 0):.2f}s)",
+        )
 
 
 def force_greedy(obj, label: str):
@@ -461,7 +477,7 @@ except Exception:
     SUPPORTED_SPEAKERS = []
 
 status(
-    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} chunk_gen_timeout_s={CHUNK_GEN_TIMEOUT_SECONDS:g} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f}"
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} chunk_gen_timeout_s={CHUNK_GEN_TIMEOUT_SECONDS:g} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f} synth_acquire_timeout_s={SYNTH_ACQUIRE_TIMEOUT_SECONDS:g} busy_status={SYNTH_BUSY_STATUS_CODE}"
 )
 
 
@@ -1027,7 +1043,7 @@ def speak(
                 for idx, part in enumerate(parts):
                     status(f"speak: processing chunk {idx + 1}/{len(parts)} (stream)")
 
-                    GPU_SYNTH_SEMAPHORE.acquire()
+                    _acquire_synth_slot_or_busy()
                     try:
                         if idx == 0 and first_word_latency_seconds is None:
                             first_word_latency_seconds = time.perf_counter() - request_start
@@ -1088,7 +1104,7 @@ def speak(
         for idx, part in enumerate(parts):
             status(f"speak: processing chunk {idx + 1}/{len(parts)}")
 
-            GPU_SYNTH_SEMAPHORE.acquire()
+            _acquire_synth_slot_or_busy()
             try:
                 if idx == 0 and first_word_latency_seconds is None:
                     # First-word proxy: when first chunk is about to enter model inference.
