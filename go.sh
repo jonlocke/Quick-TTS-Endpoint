@@ -3,8 +3,8 @@ set -euo pipefail
 
 python3 -m venv ~/qwen-tts-venv
 source ~/qwen-tts-venv/bin/activate
-export QWEN_TRAIN_TXT="HelBonCart.txt"
-export QWEN_TRAIN_WAV="HelBonCart.wav"
+export QWEN_TRAIN_TXT="liz.txt"
+export QWEN_TRAIN_WAV="liz.wav"
 export QWEN_GPU_SYNTH_CONCURRENCY=1
 export QWEN_FORCE_FP32=1 # work around gtx1080 fp16 prb, on ++ models try fp16 for perf. imprv.
 export QWEN_WAV_ENCODER_THREADS=4

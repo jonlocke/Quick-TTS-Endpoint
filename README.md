@@ -26,6 +26,9 @@ You can override paths with:
 - `QWEN_TRAIN_WAV`
 - `QWEN_TRAIN_TXT`
 
+If training files are missing, startup now continues without voice-clone prompt inputs.
+Set `QWEN_REQUIRE_TRAINING_FILES=1` to make missing files a hard startup error.
+
 When training prompt files are present, the server defaults to clone-first behavior
 instead of a fixed built-in speaker. Optional tuning:
 
@@ -42,6 +45,8 @@ falls back to `generate_custom_voice(...)` compatibility logic.
 
 If you are benchmarking GPU inference, call `/speak` with `play=false` to avoid ffplay server-side playback CPU overhead.
 
+If a single synthesis chunk takes too long, the server now bails out by default after 150s (`QWEN_CHUNK_GEN_TIMEOUT_SECONDS`, i.e. 2:30). Set to `0` to disable.
+
 If `nvidia-smi` appears to show VRAM climbing chunk-by-chunk, tune cache compaction with `QWEN_CUDA_CACHE_CLEAR_POLICY`:
 
 - `off` (default): fastest, keep allocator cache for reuse
@@ -53,7 +58,9 @@ If `nvidia-smi` appears to show VRAM climbing chunk-by-chunk, tune cache compact
 
 When `generate_voice_clone(...)` and `create_voice_clone_prompt(...)` are both available in your installed `qwen-tts`, the server now builds the reference prompt once at startup and reuses it via `voice_clone_prompt` for subsequent generations.
 
-Input normalization: `/speak` now converts integer digits to words (e.g. `3` -> `three`) and strips non-speech symbols before synthesis.
+Input normalization: `/speak` now converts integer digits to words (e.g. `3` -> `three`) and strips non-speech symbols before synthesis, while preserving punctuation cues like `, . ! ? : ;`.
+
+List formatting cue: if an input line starts as a bullet/numbered point (`-`, `*`, `•`, `1.`, `1)`), the server appends a trailing full stop when missing so speech cadence sounds natural.
 
 
 ## Low-latency chunk delivery to clients
@@ -68,3 +75,95 @@ playback immediately:
   paragraph is within `max_chars`; overlong paragraphs fall back to sentence chunking.
 
 `stream_audio_chunks=1` cannot be combined with `return_audio=1`.
+
+
+## Prepare training audio (normalize to `train.wav`)
+
+Use the helper script to normalize a source wav into training format:
+
+```bash
+./scripts/normalize-training-wav.sh <input-wav-or-basepath> [output-wav]
+```
+
+Example (your requested ffmpeg chain, outputting `train.wav`):
+
+```bash
+./scripts/normalize-training-wav.sh my_voice.wav train.wav
+```
+
+## NVIDIA Container Toolkit install (manual)
+
+If Docker is installed but `docker info --format '{{json .Runtimes}}'` does not show `nvidia`, install/configure toolkit:
+
+```bash
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+docker info --format '{{json .Runtimes}}' | grep -i nvidia
+```
+
+You can also run the helper script:
+
+```bash
+./scripts/deps.sh
+```
+
+Set `INSTALL_TOOLKIT=0` to skip toolkit changes and only install Python/system deps.
+
+## Docker workflow (NVIDIA CUDA Ubuntu 24.04 base)
+
+This repo now includes a GPU-ready container flow built on `nvidia/cuda:12.6.0-runtime-ubuntu24.04`:
+
+1. Build image:
+
+```bash
+./scripts/docker-build.sh
+```
+
+Optional build naming:
+
+```bash
+IMAGE_NAME=my-qwen-tts IMAGE_TAG=dev ./scripts/docker-build.sh
+BASE_IMAGE=nvidia/cuda:12.6.0-runtime-ubuntu24.04 IMAGE_TAG=dev ./scripts/docker-build.sh
+TORCH_VERSION=2.3.1+cu118 TORCHVISION_VERSION=0.18.1+cu118 TORCHAUDIO_VERSION=2.3.1+cu118 ./scripts/docker-build.sh
+```
+
+2. Run container with GPU access:
+
+```bash
+./scripts/docker-run.sh
+```
+
+Backwards-compatible shortcuts:
+
+```bash
+./scripts/build.sh
+./scripts/run.sh
+```
+
+`./scripts/run.sh` maps host `8765` to container `8765` by default (override with `HOST_PORT`).
+
+Optional runtime overrides:
+
+```bash
+HOST_PORT=9000 IMAGE_TAG=dev ./scripts/docker-run.sh
+DOCKER_GPU_MODE=on ./scripts/docker-run.sh
+DOCKER_GPU_MODE=off ./scripts/docker-run.sh  # only for custom CPU-capable images
+PERSIST_MODEL_CACHE=1 MODEL_CACHE_HOST_DIR=$HOME/.cache/quick-tts-hf ./scripts/docker-run.sh
+RESTART_POLICY=unless-stopped ./scripts/docker-run.sh
+HEALTH_TIMEOUT_SEC=900 ./scripts/docker-run.sh
+```
+
+Notes:
+- `scripts/docker-run.sh` starts the container in detached mode and waits for `/health` to report ready (default timeout `HEALTH_TIMEOUT_SEC=600`).
+- Container restart policy defaults to `unless-stopped` (override with `RESTART_POLICY`).
+- `scripts/docker-run.sh` auto-mounts training files only when **both** `train.wav` and `train.txt` are present in the repo root.
+- The Dockerfile `CMD` only starts `uvicorn`; mounts must be provided at container run time (for example via `scripts/docker-run.sh` / `scripts/run.sh` or explicit `docker run -v ...`).
+- Model cache is persisted by default using a host bind mount (`./.hf-cache` in repo root) mapped to `/root/.cache/huggingface`.
+- Configure cache persistence with `PERSIST_MODEL_CACHE` (`1` default) and `MODEL_CACHE_HOST_DIR`.
+- `DOCKER_GPU_MODE` controls GPU flags (`auto` default, `on`, `off`).
+- Default `auto` now fails fast if NVIDIA Docker runtime is missing (instead of starting and then crashing).
+- `DOCKER_GPU_MODE=off` is only for custom CPU-capable images; this repo's default server enforces CUDA at startup.
+- Service listens on container port `8765`.
