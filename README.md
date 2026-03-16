@@ -58,6 +58,8 @@ To force `/speak` to use Piper for testing (instead of Qwen synthesis), set:
 
 This service sends HTTP `POST` requests to Piper and does not execute Docker or local Piper binaries.
 
+If `PIPER_HTTP_URL` is set to just host:port (for example `http://wyoming-piper:10200`), the server will automatically try `/api/tts` first.
+
 
 If `/speak` cannot acquire a Qwen synth slot within `QWEN_SYNTH_ACQUIRE_TIMEOUT_SECONDS`, it now falls back to [piper](https://github.com/rhasspy/piper) (instead of returning busy) when enabled:
 

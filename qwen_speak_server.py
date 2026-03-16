@@ -34,6 +34,7 @@ Env overrides:
   PIPER_HTTP_TIMEOUT_SECONDS default: 120
   PIPER_SPEAKER optional speaker id forwarded to piper HTTP backend
 import urllib.error
+import urllib.parse
 import urllib.request
   QWEN_BUSY_FALLBACK_PIPER default: 1 (if busy, synthesize via piper instead of returning busy)
   QWEN_FORCE_PIPER default: 0 (route all /speak synthesis through piper)
@@ -167,33 +168,69 @@ def _synthesize_with_piper_http(text: str) -> Tuple[np.ndarray, int]:
                 last_error = f"Piper HTTP returned empty audio from {piper_url}"
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="ignore")[-300:]
-            last_error = f"Piper HTTP request failed (url={piper_url} status={exc.code}): {body}"
-            continue
-        except urllib.error.URLError as exc:
-            last_error = f"Piper HTTP backend unavailable (url={piper_url}): {exc.reason}"
-            continue
+def _piper_candidate_urls(configured_url: str) -> list[str]:
+    raw = (configured_url or "").strip()
+    if not raw:
+        raw = "http://wyoming-piper:10200/api/tts"
+    if "://" not in raw:
+        raw = "http://" + raw
 
-    if not wav_bytes:
-        raise HTTPException(status_code=503, detail=last_error or "Piper HTTP backend unavailable")
+    parsed = urllib.parse.urlparse(raw)
+    path = (parsed.path or "").rstrip("/")
+    base = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else raw.rstrip("/")
 
+    if not path:
+        return [base + "/api/tts", base]
+    if path == "/api/tts":
+        return [base + "/api/tts", base + "/api/tts/"]
+    return [raw]
+
+
+def _decode_piper_response_bytes(raw_bytes: bytes) -> bytes:
+    if not raw_bytes:
+        return b""
     try:
-        wav, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32")
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Piper HTTP response was not valid WAV: {exc}")
+        decoded = json.loads(raw_bytes.decode("utf-8"))
+    except Exception:
+        return raw_bytes
 
-    wav = np.asarray(wav, dtype=np.float32)
-    if wav.ndim > 1:
-        wav = wav[:, 0]
-    return wav, int(sr)
+    for key in ("audio", "audio_base64", "wav_base64"):
+        value = decoded.get(key)
+        if isinstance(value, str) and value:
+            try:
+                return base64.b64decode(value)
+            except Exception:
+                continue
+    return raw_bytes
 
 
-DEFAULT_SPEAKER = os.environ.get("QWEN_SPEAKER", "ryan").strip().lower()
-DEFAULT_LANG = os.environ.get("QWEN_LANG", "english").strip().lower()
-DEFAULT_INSTRUCT = os.environ.get(
-    "QWEN_INSTRUCT",
-    "Read the text clearly, naturally, and conversationally.",
-).strip()
-
+    timeout = max(1.0, PIPER_HTTP_TIMEOUT_SECONDS)
+    payloads = [{"text": text, "voice": PIPER_MODEL}, {"text": text, "model": PIPER_MODEL}, {"text": text}]
+        payloads[0]["speaker"] = PIPER_SPEAKER
+        payloads[1]["speaker_id"] = PIPER_SPEAKER
+    for piper_url in _piper_candidate_urls(PIPER_HTTP_URL):
+        for payload in payloads:
+            req = urllib.request.Request(
+                piper_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json", "Accept": "audio/wav, application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    wav_bytes = _decode_piper_response_bytes(resp.read())
+                    if wav_bytes:
+                        break
+                    last_error = f"Piper HTTP returned empty audio from {piper_url}"
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="ignore")[-300:]
+                last_error = f"Piper HTTP request failed (url={piper_url} status={exc.code}): {body}"
+                continue
+            except urllib.error.URLError as exc:
+                last_error = f"Piper HTTP backend unavailable (url={piper_url}): {exc.reason}"
+                continue
+        if wav_bytes:
+            break
 TRAIN_WAV_PATH = os.environ.get("QWEN_TRAIN_WAV", "train.wav").strip()
 TRAIN_TXT_PATH = os.environ.get("QWEN_TRAIN_TXT", "train.txt").strip()
 ALLOW_SPEAKER_WITH_TRAIN = os.environ.get("QWEN_ALLOW_SPEAKER_WITH_TRAIN", "0").strip().lower() in (
