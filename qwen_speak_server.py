@@ -36,6 +36,7 @@ Env overrides:
   PIPER_SPEAKER optional speaker id for multi-speaker piper models
   PIPER_DOCKER_CONTAINER default: "" (optional; when set, run piper via docker exec into existing container)
   PIPER_DOCKER_EXEC_REQUIRED default: 0 (if 1, fail when docker-exec is unavailable; if 0, fallback to local piper bin)
+  (when piper backend is unavailable, busy fallback is skipped and busy response is preserved)
 
 Deps (WSL):
   sudo apt-get install -y ffmpeg sox libsox-fmt-all
@@ -50,6 +51,7 @@ import gc
 import os
 import re
 import subprocess
+import shutil
 import threading
 import time
 import queue
@@ -224,6 +226,15 @@ def _run_piper_cmd(cmd: list[str], text: str) -> subprocess.CompletedProcess[byt
     )
 
 
+def _piper_backend_configured() -> bool:
+    """Best-effort gate to avoid replacing busy errors with missing-piper errors."""
+    if PIPER_DOCKER_CONTAINER:
+        # Docker-exec mode explicitly requested.
+        return True
+    # Local binary mode requires an installed piper executable.
+    return bool(shutil.which(PIPER_BIN))
+
+
 def _synthesize_with_piper(text: str) -> Tuple[np.ndarray, int]:
     attempted_docker_exec = bool(PIPER_DOCKER_CONTAINER)
     cmd = _build_piper_cmd(use_docker_exec=attempted_docker_exec)
@@ -281,6 +292,8 @@ def _http_status_for_piper() -> int:
 
 def _synthesize_with_busy_fallback(text: str, speaker: str, language: str, instruct: str) -> Tuple[np.ndarray, int, bool]:
     if PIPER_FORCE_REQUESTS:
+        if not _piper_backend_configured():
+            raise HTTPException(status_code=503, detail=f"Forced Piper mode enabled but backend unavailable (bin={PIPER_BIN}, docker_container={PIPER_DOCKER_CONTAINER or '-'})")
         status("speak: using piper (forced by QWEN_FORCE_PIPER)")
         wav, sr = _synthesize_with_piper(text)
         return wav, sr, True
@@ -295,6 +308,9 @@ def _synthesize_with_busy_fallback(text: str, speaker: str, language: str, instr
         return wav, sr, False
     except HTTPException as exc:
         if not (PIPER_BUSY_FALLBACK and _is_busy_http_exception(exc)):
+            raise
+        if not _piper_backend_configured():
+            status("speak: qwen synth busy; piper backend unavailable, keeping busy response")
             raise
         status("speak: qwen synth busy, using piper fallback for chunk")
         wav, sr = _synthesize_with_piper(text)
@@ -603,7 +619,7 @@ except Exception:
     SUPPORTED_SPEAKERS = []
 
 status(
-    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} chunk_gen_timeout_s={CHUNK_GEN_TIMEOUT_SECONDS:g} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f} synth_acquire_timeout_s={SYNTH_ACQUIRE_TIMEOUT_SECONDS:g} busy_status={SYNTH_BUSY_STATUS_CODE} piper_busy_fallback={'on' if PIPER_BUSY_FALLBACK else 'off'} piper_model_configured={'yes' if bool(PIPER_MODEL) else 'no'} piper_forced={'on' if PIPER_FORCE_REQUESTS else 'off'} piper_docker_container={PIPER_DOCKER_CONTAINER or '-'} piper_docker_exec_required={'on' if PIPER_DOCKER_EXEC_REQUIRED else 'off'}"
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} chunk_gen_timeout_s={CHUNK_GEN_TIMEOUT_SECONDS:g} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f} synth_acquire_timeout_s={SYNTH_ACQUIRE_TIMEOUT_SECONDS:g} busy_status={SYNTH_BUSY_STATUS_CODE} piper_busy_fallback={'on' if PIPER_BUSY_FALLBACK else 'off'} piper_model_configured={'yes' if bool(PIPER_MODEL) else 'no'} piper_forced={'on' if PIPER_FORCE_REQUESTS else 'off'} piper_docker_container={PIPER_DOCKER_CONTAINER or '-'} piper_docker_exec_required={'on' if PIPER_DOCKER_EXEC_REQUIRED else 'off'} piper_backend_ready={'yes' if _piper_backend_configured() else 'no'}"
 )
 
 

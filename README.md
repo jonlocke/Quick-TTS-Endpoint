@@ -60,6 +60,10 @@ If `/speak` cannot acquire a Qwen synth slot within `QWEN_SYNTH_ACQUIRE_TIMEOUT_
 
 If piper is used (forced or busy fallback), the response includes `used_piper_fallback: true` in JSON/NDJSON completion, and `X-Qwen-Used-Piper-Fallback: 1` for `return_audio=1`.
 
+If the Piper backend is unavailable at runtime (for example, no local `piper` binary and no docker-exec container configured), busy fallback is skipped and the original busy response is returned.
+
+If `QWEN_FORCE_PIPER=1` is set while backend is unavailable, `/speak` now returns a clear `503` configuration error.
+
 This server does **not** start or manage a Piper container.
 
 To use an already-running `wyoming-piper` container via `docker exec`, set:
