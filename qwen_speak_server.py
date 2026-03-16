@@ -181,8 +181,10 @@ def _piper_candidate_urls(configured_url: str) -> list[str]:
 
     if not path:
         return [base + "/api/tts", base]
-    elif path == "/api/tts":
+
+    if path == "/api/tts":
         return [base + "/api/tts", base + "/api/tts/"]
+
     return [raw]
 
 
