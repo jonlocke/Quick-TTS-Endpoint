@@ -28,6 +28,13 @@ Env overrides:
   QWEN_WAV_ENCODER_THREADS default: 2 (CPU pool for WAV encoding)
   QWEN_GPU_SYNTH_CONCURRENCY default: 1 (max concurrent synth calls; can increase activation memory)
   QWEN_FP16_RETRY_FP32 default: 1 (retry failed fp16 synth in fp32 autocast-off mode)
+  QWEN_FORCE_PIPER default: 0 (route all /speak synthesis through piper HTTP backend)
+  PIPER_MODEL default: en_US-lessac-medium
+  PIPER_HTTP_URL default: http://wyoming-piper:10200
+  PIPER_HTTP_TIMEOUT_SECONDS default: 120
+  PIPER_SPEAKER optional speaker id forwarded to piper HTTP backend
+import urllib.error
+import urllib.request
   QWEN_BUSY_FALLBACK_PIPER default: 1 (if busy, synthesize via piper instead of returning busy)
   QWEN_FORCE_PIPER default: 0 (route all /speak synthesis through piper)
   PIPER_BIN default: piper
@@ -122,6 +129,49 @@ CUDA_CACHE_PRESSURE_THRESHOLD = float(os.environ.get("QWEN_CUDA_CACHE_PRESSURE_T
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+
+QWEN_FORCE_PIPER = os.environ.get("QWEN_FORCE_PIPER", "0").strip().lower() in ("1", "true", "yes", "on")
+PIPER_MODEL = os.environ.get("PIPER_MODEL", "en_US-lessac-medium").strip() or "en_US-lessac-medium"
+PIPER_HTTP_URL = os.environ.get("PIPER_HTTP_URL", "http://wyoming-piper:10200").strip() or "http://wyoming-piper:10200"
+_piper_http_timeout_raw = (os.environ.get("PIPER_HTTP_TIMEOUT_SECONDS", "120") or "120").strip()
+try:
+    PIPER_HTTP_TIMEOUT_SECONDS = max(1.0, float(_piper_http_timeout_raw))
+except Exception:
+    PIPER_HTTP_TIMEOUT_SECONDS = 120.0
+PIPER_SPEAKER = os.environ.get("PIPER_SPEAKER", "").strip()
+
+def _synthesize_with_piper_http(text: str) -> Tuple[np.ndarray, int]:
+    payload = {"text": text, "voice": PIPER_MODEL}
+    if PIPER_SPEAKER:
+        payload["speaker"] = PIPER_SPEAKER
+    req = urllib.request.Request(
+        PIPER_HTTP_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "audio/wav"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=max(1.0, PIPER_HTTP_TIMEOUT_SECONDS)) as resp:
+            wav_bytes = resp.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")[-300:]
+        raise HTTPException(status_code=503, detail=f"Piper HTTP request failed (status={exc.code}): {body}")
+    except urllib.error.URLError as exc:
+        raise HTTPException(status_code=503, detail=f"Piper HTTP backend unavailable: {exc.reason}")
+
+    if not wav_bytes:
+        raise HTTPException(status_code=503, detail="Piper HTTP returned empty audio")
+
+    try:
+        wav, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Piper HTTP response was not valid WAV: {exc}")
+
+    wav = np.asarray(wav, dtype=np.float32)
+    if wav.ndim > 1:
+        wav = wav[:, 0]
+    return wav, int(sr)
+
 
 DEFAULT_SPEAKER = os.environ.get("QWEN_SPEAKER", "ryan").strip().lower()
 DEFAULT_LANG = os.environ.get("QWEN_LANG", "english").strip().lower()
@@ -452,7 +502,7 @@ def _build_training_voice_kwargs() -> dict:
         "prompt_wav_path",
         "reference_audio",
         "reference_audio_path",
-        "ref_audio",
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} chunk_gen_timeout_s={CHUNK_GEN_TIMEOUT_SECONDS:g} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f} synth_acquire_timeout_s={SYNTH_ACQUIRE_TIMEOUT_SECONDS:g} busy_status={SYNTH_BUSY_STATUS_CODE} force_piper={'on' if QWEN_FORCE_PIPER else 'off'} piper_http_url={PIPER_HTTP_URL}"
         "ref_audio_path",
         "clone_audio",
         "clone_audio_path",
@@ -975,16 +1025,19 @@ def _synthesize_to_audio(text: str, speaker: str, language: str, instruct: str) 
     return wav, int(sr)
 
 
-def _synthesize_to_audio_with_timeout(text: str, speaker: str, language: str, instruct: str) -> Tuple[np.ndarray, int]:
-    """Run chunk synthesis with a hard timeout bail-out."""
-    if CHUNK_GEN_TIMEOUT_SECONDS <= 0:
-        return _synthesize_to_audio(text, speaker, language, instruct)
-
-    future = synth_pool.submit(_synthesize_to_audio, text, speaker, language, instruct)
-    try:
-        return future.result(timeout=CHUNK_GEN_TIMEOUT_SECONDS)
-    except concurrent.futures.TimeoutError:
-        future.cancel()
+    if (not QWEN_FORCE_PIPER) and SUPPORTED_SPEAKERS and speaker not in SUPPORTED_SPEAKERS:
+    if (not QWEN_FORCE_PIPER) and SUPPORTED_LANGS and language not in SUPPORTED_LANGS:
+                    if idx == 0 and first_word_latency_seconds is None:
+                        first_word_latency_seconds = time.perf_counter() - request_start
+                    if QWEN_FORCE_PIPER:
+                        wav, sr = _synthesize_with_piper_http(part)
+                    else:
+                        _acquire_synth_slot_or_busy()
+                        try:
+                            wav, sr = _synthesize_to_audio_with_timeout(part, speaker, language, instruct)
+                        finally:
+                            GPU_SYNTH_SEMAPHORE.release()
+                            _maybe_compact_cuda_heap(stage="chunk")
         raise TimeoutError(
             f"Chunk synthesis exceeded timeout of {CHUNK_GEN_TIMEOUT_SECONDS:.1f}s"
         )
@@ -1079,15 +1132,18 @@ play_q: "queue.Queue[SpeakJob]" = queue.Queue(maxsize=PLAY_Q_MAX)
 _worker_stop = threading.Event()
 
 
-def _play_wav_bytes(wav_bytes: bytes) -> None:
-    # Stream wav bytes directly to ffplay stdin (avoids temp-file churn).
-    subprocess.run(
-        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-i", "pipe:0"],
-        input=wav_bytes,
-        check=False,
-    )
-
-
+            if idx == 0 and first_word_latency_seconds is None:
+                # First-word proxy: when first chunk is about to enter model inference.
+                first_word_latency_seconds = time.perf_counter() - request_start
+            if QWEN_FORCE_PIPER:
+                wav, sr = _synthesize_with_piper_http(part)
+            else:
+                _acquire_synth_slot_or_busy()
+                try:
+                    wav, sr = _synthesize_to_audio_with_timeout(part, speaker, language, instruct)
+                finally:
+                    GPU_SYNTH_SEMAPHORE.release()
+                    _maybe_compact_cuda_heap(stage="chunk")
 def _worker_loop():
     while not _worker_stop.is_set():
         try:

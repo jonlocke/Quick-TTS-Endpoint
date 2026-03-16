@@ -47,6 +47,18 @@ If you are benchmarking GPU inference, call `/speak` with `play=false` to avoid 
 
 If a single synthesis chunk takes too long, the server now bails out by default after 150s (`QWEN_CHUNK_GEN_TIMEOUT_SECONDS`, i.e. 2:30). Set to `0` to disable.
 
+
+To force `/speak` to use Piper for testing (instead of Qwen synthesis), set:
+
+- `QWEN_FORCE_PIPER=1`
+- `PIPER_HTTP_URL` (default `http://wyoming-piper:10200`)
+- `PIPER_HTTP_TIMEOUT_SECONDS` (default `120`)
+- `PIPER_MODEL` (default `en_US-lessac-medium`)
+- `PIPER_SPEAKER` (optional)
+
+This service sends HTTP `POST` requests to Piper and does not execute Docker or local Piper binaries.
+
+
 If `/speak` cannot acquire a Qwen synth slot within `QWEN_SYNTH_ACQUIRE_TIMEOUT_SECONDS`, it now falls back to [piper](https://github.com/rhasspy/piper) (instead of returning busy) when enabled:
 
 - `QWEN_BUSY_FALLBACK_PIPER=1` (default on)
