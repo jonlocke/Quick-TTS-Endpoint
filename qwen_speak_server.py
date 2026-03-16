@@ -169,9 +169,7 @@ def _synthesize_with_piper_http(text: str) -> Tuple[np.ndarray, int]:
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="ignore")[-300:]
 def _piper_candidate_urls(configured_url: str) -> list[str]:
-    raw = (configured_url or "").strip()
-    if not raw:
-        raw = "http://wyoming-piper:10200/api/tts"
+    raw = (configured_url or "").strip() or "http://wyoming-piper:10200/api/tts"
     if "://" not in raw:
         raw = "http://" + raw
 
@@ -180,11 +178,9 @@ def _piper_candidate_urls(configured_url: str) -> list[str]:
     base = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else raw.rstrip("/")
 
     if not path:
-        return [base + "/api/tts", base]
-
+        return [f"{base}/api/tts", base]
     if path == "/api/tts":
-        return [base + "/api/tts", base + "/api/tts/"]
-
+        return [f"{base}/api/tts", f"{base}/api/tts/"]
     return [raw]
 
 
