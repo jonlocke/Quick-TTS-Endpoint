@@ -28,6 +28,14 @@ Env overrides:
   QWEN_WAV_ENCODER_THREADS default: 2 (CPU pool for WAV encoding)
   QWEN_GPU_SYNTH_CONCURRENCY default: 1 (max concurrent synth calls; can increase activation memory)
   QWEN_FP16_RETRY_FP32 default: 1 (retry failed fp16 synth in fp32 autocast-off mode)
+  QWEN_BUSY_FALLBACK_PIPER default: 1 (if busy, synthesize via piper instead of returning busy)
+  QWEN_FORCE_PIPER default: 0 (route all /speak synthesis through piper)
+  PIPER_BIN default: piper
+  PIPER_MODEL default: en_US-lessac-medium
+  PIPER_CONFIG optional path to piper model config
+  PIPER_SPEAKER optional speaker id for multi-speaker piper models
+  PIPER_DOCKER_CONTAINER default: "" (optional; when set, run piper via docker exec into existing container)
+  PIPER_DOCKER_EXEC_REQUIRED default: 0 (if 1, fail when docker-exec is unavailable; if 0, fallback to local piper bin)
 
 Deps (WSL):
   sudo apt-get install -y ffmpeg sox libsox-fmt-all
@@ -148,6 +156,21 @@ SYNTH_BUSY_STATUS_CODE = int(os.environ.get("QWEN_SYNTH_BUSY_STATUS_CODE", "429"
 # Caps concurrent model inference calls per worker (primarily affects concurrent HTTP requests).
 GPU_SYNTH_SEMAPHORE = threading.BoundedSemaphore(value=GPU_SYNTH_CONCURRENCY)
 
+PIPER_BUSY_FALLBACK = os.environ.get("QWEN_BUSY_FALLBACK_PIPER", "1").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+PIPER_FORCE_REQUESTS = os.environ.get("QWEN_FORCE_PIPER", "0").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+PIPER_BIN = os.environ.get("PIPER_BIN", "piper").strip() or "piper"
+PIPER_MODEL = os.environ.get("PIPER_MODEL", "en_US-lessac-medium").strip() or "en_US-lessac-medium"
+PIPER_CONFIG = os.environ.get("PIPER_CONFIG", "").strip()
+PIPER_SPEAKER = os.environ.get("PIPER_SPEAKER", "").strip()
+PIPER_DOCKER_CONTAINER = os.environ.get("PIPER_DOCKER_CONTAINER", "").strip()
+PIPER_DOCKER_EXEC_REQUIRED = os.environ.get("PIPER_DOCKER_EXEC_REQUIRED", "0").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+
 app = FastAPI()
 
 
@@ -173,6 +196,109 @@ def _acquire_synth_slot_or_busy() -> None:
             status_code=SYNTH_BUSY_STATUS_CODE,
             detail=f"TTS synth is busy; retry shortly (waited {max(timeout, 0):.2f}s)",
         )
+
+
+def _is_busy_http_exception(exc: Exception) -> bool:
+    return isinstance(exc, HTTPException) and int(getattr(exc, "status_code", 0)) == SYNTH_BUSY_STATUS_CODE
+
+
+def _build_piper_cmd(use_docker_exec: bool) -> list[str]:
+    cmd = [PIPER_BIN, "--model", PIPER_MODEL, "--output_raw"]
+    if PIPER_CONFIG:
+        cmd.extend(["--config", PIPER_CONFIG])
+    if PIPER_SPEAKER:
+        cmd.extend(["--speaker", PIPER_SPEAKER])
+
+    if use_docker_exec and PIPER_DOCKER_CONTAINER:
+        return ["docker", "exec", "-i", PIPER_DOCKER_CONTAINER, *cmd]
+    return cmd
+
+
+def _run_piper_cmd(cmd: list[str], text: str) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        cmd,
+        input=(text + "\n").encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def _synthesize_with_piper(text: str) -> Tuple[np.ndarray, int]:
+    attempted_docker_exec = bool(PIPER_DOCKER_CONTAINER)
+    cmd = _build_piper_cmd(use_docker_exec=attempted_docker_exec)
+
+    try:
+        proc = _run_piper_cmd(cmd, text)
+    except FileNotFoundError:
+        if attempted_docker_exec and not PIPER_DOCKER_EXEC_REQUIRED:
+            status("speak: docker CLI unavailable for piper docker-exec; retrying with local piper binary")
+            try:
+                proc = _run_piper_cmd(_build_piper_cmd(use_docker_exec=False), text)
+            except FileNotFoundError:
+                raise HTTPException(
+                    status_code=_http_status_for_piper(),
+                    detail=f"Piper command not found (bin={PIPER_BIN}); docker CLI also unavailable",
+                )
+        else:
+            raise HTTPException(
+                status_code=_http_status_for_piper(),
+                detail=(f"Piper command not found (bin={PIPER_BIN})" if not attempted_docker_exec else "Docker CLI not found for Piper docker-exec mode"),
+            )
+
+    if proc.returncode != 0 and attempted_docker_exec and not PIPER_DOCKER_EXEC_REQUIRED:
+        status("speak: piper docker-exec failed; retrying with local piper binary")
+        try:
+            fallback_proc = _run_piper_cmd(_build_piper_cmd(use_docker_exec=False), text)
+            if fallback_proc.returncode == 0:
+                proc = fallback_proc
+        except FileNotFoundError:
+            pass
+
+    if proc.returncode != 0:
+        stderr_text = proc.stderr.decode("utf-8", errors="ignore")[-300:]
+        raise HTTPException(
+            status_code=_http_status_for_piper(),
+            detail=f"Piper synthesis failed (exit={proc.returncode}): {stderr_text}",
+        )
+
+    audio_i16 = np.frombuffer(proc.stdout, dtype=np.int16)
+    if audio_i16.size == 0:
+        raise HTTPException(
+            status_code=_http_status_for_piper(),
+            detail="Piper synthesis returned empty audio",
+        )
+
+    # Piper commonly emits 22050Hz mono PCM when using --output_raw.
+    sample_rate = 22050
+    audio_f32 = (audio_i16.astype(np.float32) / 32768.0).squeeze()
+    return audio_f32, sample_rate
+
+
+def _http_status_for_piper() -> int:
+    return 503 if PIPER_FORCE_REQUESTS else SYNTH_BUSY_STATUS_CODE
+
+
+def _synthesize_with_busy_fallback(text: str, speaker: str, language: str, instruct: str) -> Tuple[np.ndarray, int, bool]:
+    if PIPER_FORCE_REQUESTS:
+        status("speak: using piper (forced by QWEN_FORCE_PIPER)")
+        wav, sr = _synthesize_with_piper(text)
+        return wav, sr, True
+
+    try:
+        _acquire_synth_slot_or_busy()
+        try:
+            wav, sr = _synthesize_to_audio_with_timeout(text, speaker, language, instruct)
+        finally:
+            GPU_SYNTH_SEMAPHORE.release()
+            _maybe_compact_cuda_heap(stage="chunk")
+        return wav, sr, False
+    except HTTPException as exc:
+        if not (PIPER_BUSY_FALLBACK and _is_busy_http_exception(exc)):
+            raise
+        status("speak: qwen synth busy, using piper fallback for chunk")
+        wav, sr = _synthesize_with_piper(text)
+        return wav, sr, True
 
 
 def force_greedy(obj, label: str):
@@ -477,7 +603,7 @@ except Exception:
     SUPPORTED_SPEAKERS = []
 
 status(
-    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} chunk_gen_timeout_s={CHUNK_GEN_TIMEOUT_SECONDS:g} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f} synth_acquire_timeout_s={SYNTH_ACQUIRE_TIMEOUT_SECONDS:g} busy_status={SYNTH_BUSY_STATUS_CODE}"
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} chunk_gen_timeout_s={CHUNK_GEN_TIMEOUT_SECONDS:g} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f} synth_acquire_timeout_s={SYNTH_ACQUIRE_TIMEOUT_SECONDS:g} busy_status={SYNTH_BUSY_STATUS_CODE} piper_busy_fallback={'on' if PIPER_BUSY_FALLBACK else 'off'} piper_model_configured={'yes' if bool(PIPER_MODEL) else 'no'} piper_forced={'on' if PIPER_FORCE_REQUESTS else 'off'} piper_docker_container={PIPER_DOCKER_CONTAINER or '-'} piper_docker_exec_required={'on' if PIPER_DOCKER_EXEC_REQUIRED else 'off'}"
 )
 
 
@@ -998,9 +1124,9 @@ def speak(
     language = (req.language or DEFAULT_LANG).strip().lower()
     instruct = (req.instruct or DEFAULT_INSTRUCT).strip()
 
-    if SUPPORTED_SPEAKERS and speaker not in SUPPORTED_SPEAKERS:
+    if (not PIPER_FORCE_REQUESTS) and SUPPORTED_SPEAKERS and speaker not in SUPPORTED_SPEAKERS:
         raise HTTPException(status_code=400, detail=f"Unsupported speaker '{speaker}'. Use GET /speakers")
-    if SUPPORTED_LANGS and language not in SUPPORTED_LANGS:
+    if (not PIPER_FORCE_REQUESTS) and SUPPORTED_LANGS and language not in SUPPORTED_LANGS:
         raise HTTPException(status_code=400, detail=f"Unsupported language '{language}'. Use GET /languages")
 
     raw_parts = _chunk_text(raw_text, max_chars=max_chars, paragraph_aware=paragraph_chunking) if chunk else [raw_text]
@@ -1020,6 +1146,7 @@ def speak(
     audio_chunks: list[bytes] = []
     first_chunk_latency_seconds: Optional[float] = None
     first_word_latency_seconds: Optional[float] = None
+    used_piper_fallback = False
 
     def _finalize_chunk(chunk_idx: int, wav_bytes: bytes) -> None:
         jid = f"{os.getpid()}-{threading.get_ident()}-{chunk_idx}"
@@ -1038,19 +1165,15 @@ def speak(
 
     if stream_audio_chunks:
         def _stream_ndjson():
-            nonlocal first_word_latency_seconds, first_chunk_latency_seconds
+            nonlocal first_word_latency_seconds, first_chunk_latency_seconds, used_piper_fallback
             try:
                 for idx, part in enumerate(parts):
                     status(f"speak: processing chunk {idx + 1}/{len(parts)} (stream)")
 
-                    _acquire_synth_slot_or_busy()
-                    try:
-                        if idx == 0 and first_word_latency_seconds is None:
-                            first_word_latency_seconds = time.perf_counter() - request_start
-                        wav, sr = _synthesize_to_audio_with_timeout(part, speaker, language, instruct)
-                    finally:
-                        GPU_SYNTH_SEMAPHORE.release()
-                        _maybe_compact_cuda_heap(stage="chunk")
+                    if idx == 0 and first_word_latency_seconds is None:
+                        first_word_latency_seconds = time.perf_counter() - request_start
+                    wav, sr, used_fallback = _synthesize_with_busy_fallback(part, speaker, language, instruct)
+                    used_piper_fallback = used_piper_fallback or used_fallback
 
                     if idx == 0 and first_chunk_latency_seconds is None:
                         first_chunk_latency_seconds = time.perf_counter() - request_start
@@ -1090,6 +1213,7 @@ def speak(
                     "latency_to_first_chunk_seconds": round(fc, 3),
                     "queue_depth": play_q.qsize(),
                     "job_ids": job_ids[:10],
+                    "used_piper_fallback": bool(used_piper_fallback),
                 }) + "\n").encode("utf-8")
             except Exception as e:
                 traceback.print_exc()
@@ -1104,15 +1228,11 @@ def speak(
         for idx, part in enumerate(parts):
             status(f"speak: processing chunk {idx + 1}/{len(parts)}")
 
-            _acquire_synth_slot_or_busy()
-            try:
-                if idx == 0 and first_word_latency_seconds is None:
-                    # First-word proxy: when first chunk is about to enter model inference.
-                    first_word_latency_seconds = time.perf_counter() - request_start
-                wav, sr = _synthesize_to_audio_with_timeout(part, speaker, language, instruct)
-            finally:
-                GPU_SYNTH_SEMAPHORE.release()
-                _maybe_compact_cuda_heap(stage="chunk")
+            if idx == 0 and first_word_latency_seconds is None:
+                # First-word proxy: when first chunk is about to enter model inference.
+                first_word_latency_seconds = time.perf_counter() - request_start
+            wav, sr, used_fallback = _synthesize_with_busy_fallback(part, speaker, language, instruct)
+            used_piper_fallback = used_piper_fallback or used_fallback
 
             if idx == 0 and first_chunk_latency_seconds is None:
                 # First-chunk proxy: when first synthesized chunk exits model inference.
@@ -1166,6 +1286,7 @@ def speak(
                 "X-Qwen-Latency-First-Word-Seconds": f"{first_word_latency_seconds:.3f}",
                 "X-Qwen-Latency-First-Chunk-Seconds": f"{first_chunk_latency_seconds:.3f}",
                 "X-Qwen-Processing-Seconds": f"{total_latency_seconds:.3f}",
+                "X-Qwen-Used-Piper-Fallback": "1" if used_piper_fallback else "0",
             },
         )
 
@@ -1188,4 +1309,5 @@ def speak(
         "language": language,
         "queue_depth": play_q.qsize(),
         "job_ids": job_ids[:10],  # avoid huge responses
+        "used_piper_fallback": bool(used_piper_fallback),
     })

@@ -47,6 +47,33 @@ If you are benchmarking GPU inference, call `/speak` with `play=false` to avoid 
 
 If a single synthesis chunk takes too long, the server now bails out by default after 150s (`QWEN_CHUNK_GEN_TIMEOUT_SECONDS`, i.e. 2:30). Set to `0` to disable.
 
+If `/speak` cannot acquire a Qwen synth slot within `QWEN_SYNTH_ACQUIRE_TIMEOUT_SECONDS`, it now falls back to [piper](https://github.com/rhasspy/piper) (instead of returning busy) when enabled:
+
+- `QWEN_BUSY_FALLBACK_PIPER=1` (default on)
+- `QWEN_FORCE_PIPER=0` (set to `1` to route all `/speak` synthesis through piper)
+- `PIPER_MODEL` (default `en_US-lessac-medium`)
+- `PIPER_BIN` (default `piper`)
+- `PIPER_CONFIG` (optional)
+- `PIPER_SPEAKER` (optional, for multi-speaker piper models)
+- `PIPER_DOCKER_CONTAINER` (optional; if set, server runs Piper via `docker exec -i <container> ...`)
+- `PIPER_DOCKER_EXEC_REQUIRED` (default `0`; set `1` to hard-fail if docker-exec is unavailable)
+
+If piper is used (forced or busy fallback), the response includes `used_piper_fallback: true` in JSON/NDJSON completion, and `X-Qwen-Used-Piper-Fallback: 1` for `return_audio=1`.
+
+This server does **not** start or manage a Piper container.
+
+To use an already-running `wyoming-piper` container via `docker exec`, set:
+
+```bash
+export QWEN_FORCE_PIPER=1
+export PIPER_DOCKER_CONTAINER=wyoming-piper
+# optional override:
+export PIPER_MODEL=en_US-lessac-medium
+```
+
+If `PIPER_DOCKER_CONTAINER` is not set, the server uses local `piper` binary mode only.
+If Docker CLI is unavailable where this API runs, the server automatically retries local `piper` binary unless `PIPER_DOCKER_EXEC_REQUIRED=1`.
+
 If `nvidia-smi` appears to show VRAM climbing chunk-by-chunk, tune cache compaction with `QWEN_CUDA_CACHE_CLEAR_POLICY`:
 
 - `off` (default): fastest, keep allocator cache for reuse
