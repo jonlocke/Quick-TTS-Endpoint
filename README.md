@@ -51,7 +51,7 @@ If a single synthesis chunk takes too long, the server now bails out by default 
 To force `/speak` to use Piper for testing (instead of Qwen synthesis), set:
 
 - `QWEN_FORCE_PIPER=1`
-- `PIPER_HTTP_URL` (default `http://wyoming-piper:10200`)
+- `PIPER_HTTP_URL` (default `http://wyoming-piper:10200/api/tts`)
 - `PIPER_HTTP_TIMEOUT_SECONDS` (default `120`)
 - `PIPER_MODEL` (default `en_US-lessac-medium`)
 - `PIPER_SPEAKER` (optional)

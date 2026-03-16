@@ -30,7 +30,7 @@ Env overrides:
   QWEN_FP16_RETRY_FP32 default: 1 (retry failed fp16 synth in fp32 autocast-off mode)
   QWEN_FORCE_PIPER default: 0 (route all /speak synthesis through piper HTTP backend)
   PIPER_MODEL default: en_US-lessac-medium
-  PIPER_HTTP_URL default: http://wyoming-piper:10200
+  PIPER_HTTP_URL default: http://wyoming-piper:10200/api/tts
   PIPER_HTTP_TIMEOUT_SECONDS default: 120
   PIPER_SPEAKER optional speaker id forwarded to piper HTTP backend
 import urllib.error
@@ -132,7 +132,7 @@ if torch.cuda.is_available():
 
 QWEN_FORCE_PIPER = os.environ.get("QWEN_FORCE_PIPER", "0").strip().lower() in ("1", "true", "yes", "on")
 PIPER_MODEL = os.environ.get("PIPER_MODEL", "en_US-lessac-medium").strip() or "en_US-lessac-medium"
-PIPER_HTTP_URL = os.environ.get("PIPER_HTTP_URL", "http://wyoming-piper:10200").strip() or "http://wyoming-piper:10200"
+PIPER_HTTP_URL = os.environ.get("PIPER_HTTP_URL", "http://wyoming-piper:10200/api/tts").strip() or "http://wyoming-piper:10200/api/tts"
 _piper_http_timeout_raw = (os.environ.get("PIPER_HTTP_TIMEOUT_SECONDS", "120") or "120").strip()
 try:
     PIPER_HTTP_TIMEOUT_SECONDS = max(1.0, float(_piper_http_timeout_raw))
@@ -144,23 +144,37 @@ def _synthesize_with_piper_http(text: str) -> Tuple[np.ndarray, int]:
     payload = {"text": text, "voice": PIPER_MODEL}
     if PIPER_SPEAKER:
         payload["speaker"] = PIPER_SPEAKER
-    req = urllib.request.Request(
-        PIPER_HTTP_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Accept": "audio/wav"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=max(1.0, PIPER_HTTP_TIMEOUT_SECONDS)) as resp:
-            wav_bytes = resp.read()
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="ignore")[-300:]
-        raise HTTPException(status_code=503, detail=f"Piper HTTP request failed (status={exc.code}): {body}")
-    except urllib.error.URLError as exc:
-        raise HTTPException(status_code=503, detail=f"Piper HTTP backend unavailable: {exc.reason}")
+    configured = (PIPER_HTTP_URL or "").strip()
+    base_url = configured.rstrip("/")
+    candidate_urls = [configured]
+    if configured and (configured.endswith(":10200") or configured.endswith(":10200/")):
+        candidate_urls = [base_url + "/api/tts", base_url]
+
+    last_error = ""
+    wav_bytes = b""
+    for piper_url in candidate_urls:
+        req = urllib.request.Request(
+            piper_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "audio/wav"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=max(1.0, PIPER_HTTP_TIMEOUT_SECONDS)) as resp:
+                wav_bytes = resp.read()
+                if wav_bytes:
+                    break
+                last_error = f"Piper HTTP returned empty audio from {piper_url}"
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="ignore")[-300:]
+            last_error = f"Piper HTTP request failed (url={piper_url} status={exc.code}): {body}"
+            continue
+        except urllib.error.URLError as exc:
+            last_error = f"Piper HTTP backend unavailable (url={piper_url}): {exc.reason}"
+            continue
 
     if not wav_bytes:
-        raise HTTPException(status_code=503, detail="Piper HTTP returned empty audio")
+        raise HTTPException(status_code=503, detail=last_error or "Piper HTTP backend unavailable")
 
     try:
         wav, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32")
