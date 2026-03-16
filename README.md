@@ -56,7 +56,7 @@ If `/speak` cannot acquire a Qwen synth slot within `QWEN_SYNTH_ACQUIRE_TIMEOUT_
 - `PIPER_CONFIG` (optional)
 - `PIPER_SPEAKER` (optional, for multi-speaker piper models)
 - `PIPER_DOCKER_CONTAINER` (optional; if set, server runs Piper via `docker exec -i <container> ...`)
-- `PIPER_DOCKER_EXEC_REQUIRED` (default `0`; set `1` to hard-fail if docker-exec is unavailable)
+- `PIPER_DOCKER_EXEC_REQUIRED` (default `1`; set `0` to allow fallback to local `piper` binary if docker-exec is unavailable)
 
 If piper is used (forced or busy fallback), the response includes `used_piper_fallback: true` in JSON/NDJSON completion, and `X-Qwen-Used-Piper-Fallback: 1` for `return_audio=1`.
 
@@ -76,7 +76,7 @@ export PIPER_MODEL=en_US-lessac-medium
 ```
 
 If `PIPER_DOCKER_CONTAINER` is not set, the server uses local `piper` binary mode only.
-If Docker CLI is unavailable where this API runs, the server automatically retries local `piper` binary unless `PIPER_DOCKER_EXEC_REQUIRED=1`.
+By default, container mode is strict: if Docker CLI is unavailable, request fails instead of trying local `piper`. Set `PIPER_DOCKER_EXEC_REQUIRED=0` only if you explicitly want local-binary fallback.
 
 If `nvidia-smi` appears to show VRAM climbing chunk-by-chunk, tune cache compaction with `QWEN_CUDA_CACHE_CLEAR_POLICY`:
 

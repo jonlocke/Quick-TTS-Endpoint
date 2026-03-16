@@ -35,7 +35,7 @@ Env overrides:
   PIPER_CONFIG optional path to piper model config
   PIPER_SPEAKER optional speaker id for multi-speaker piper models
   PIPER_DOCKER_CONTAINER default: "" (optional; when set, run piper via docker exec into existing container)
-  PIPER_DOCKER_EXEC_REQUIRED default: 0 (if 1, fail when docker-exec is unavailable; if 0, fallback to local piper bin)
+  PIPER_DOCKER_EXEC_REQUIRED default: 1 (if 1, fail when docker-exec is unavailable; if 0, fallback to local piper bin)
   (when piper backend is unavailable, busy fallback is skipped and busy response is preserved)
 
 Deps (WSL):
@@ -169,7 +169,7 @@ PIPER_MODEL = os.environ.get("PIPER_MODEL", "en_US-lessac-medium").strip() or "e
 PIPER_CONFIG = os.environ.get("PIPER_CONFIG", "").strip()
 PIPER_SPEAKER = os.environ.get("PIPER_SPEAKER", "").strip()
 PIPER_DOCKER_CONTAINER = os.environ.get("PIPER_DOCKER_CONTAINER", "").strip()
-PIPER_DOCKER_EXEC_REQUIRED = os.environ.get("PIPER_DOCKER_EXEC_REQUIRED", "0").strip().lower() in (
+PIPER_DOCKER_EXEC_REQUIRED = os.environ.get("PIPER_DOCKER_EXEC_REQUIRED", "1").strip().lower() in (
     "1", "true", "yes", "on"
 )
 
@@ -254,7 +254,7 @@ def _synthesize_with_piper(text: str) -> Tuple[np.ndarray, int]:
         else:
             raise HTTPException(
                 status_code=_http_status_for_piper(),
-                detail=(f"Piper command not found (bin={PIPER_BIN})" if not attempted_docker_exec else "Docker CLI not found for Piper docker-exec mode"),
+                detail=(f"Piper command not found (bin={PIPER_BIN})" if not attempted_docker_exec else "Docker CLI not found for Piper docker-exec mode (set PIPER_DOCKER_EXEC_REQUIRED=0 to allow local piper fallback)"),
             )
 
     if proc.returncode != 0 and attempted_docker_exec and not PIPER_DOCKER_EXEC_REQUIRED:
