@@ -139,7 +139,7 @@ try:
     PIPER_HTTP_TIMEOUT_SECONDS = max(1.0, float(_piper_http_timeout_raw))
 except Exception:
     PIPER_HTTP_TIMEOUT_SECONDS = 120.0
-PIPER_SPEAKER = os.environ.get("PIPER_SPEAKER", "").strip()
+PIPER_SPEAKER = os.environ.get("PIPER_SPEAKER", "").strip() or None
 
 def _synthesize_with_piper_http(text: str) -> Tuple[np.ndarray, int]:
     payload = {"text": text, "voice": PIPER_MODEL}
@@ -205,7 +205,7 @@ def _decode_piper_response_bytes(raw_bytes: bytes) -> bytes:
     timeout = max(1.0, PIPER_HTTP_TIMEOUT_SECONDS)
     payloads = [{"text": text, "voice": PIPER_MODEL}, {"text": text, "model": PIPER_MODEL}, {"text": text}]
         payloads[0]["speaker"] = PIPER_SPEAKER
-        payloads[1]["speaker_id"] = PIPER_SPEAKER
+    if PIPER_SPEAKER is not None:
     for piper_url in _piper_candidate_urls(PIPER_HTTP_URL):
         for payload in payloads:
             req = urllib.request.Request(
