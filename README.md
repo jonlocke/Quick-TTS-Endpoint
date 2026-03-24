@@ -45,10 +45,16 @@ If you explicitly want transcript-conditioned cloning again, set:
 - `QWEN_INCLUDE_REFERENCE_TEXT=1`
 - optionally `QWEN_PREBUILD_VOICE_CLONE_PROMPT=1`
 
+To prevent clone requests from wandering into very long decode loops, the server also caps
+generation by default with:
+
+- `QWEN_MAX_NEW_TOKENS=256`
+
 ## Startup voice snippet training
 
-On startup, the server now attempts to load a training voice snippet and transcript,
-then uses them as cloning reference inputs during synthesis:
+The older global startup training pair is now optional and disabled by default in the
+multi-voice setup. If you explicitly enable it with `QWEN_ENABLE_LEGACY_TRAINING=1`,
+the server will attempt to load:
 
 - `train.wav`
 - `train.txt` (also accepts legacy `tran.txt` automatically)

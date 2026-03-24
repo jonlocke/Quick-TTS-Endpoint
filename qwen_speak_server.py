@@ -24,8 +24,10 @@ Env overrides:
   QWEN_LANG           default: english
   QWEN_INSTRUCT       default: "Read the text clearly, naturally, and conversationally."
   QWEN_VOICE_DIRS     optional path list of directories scanned for local clone voices (*.wav + matching *.txt)
+  QWEN_ENABLE_LEGACY_TRAINING default: 0  (set 1 to also load the old global train.wav/train.txt startup pair)
   QWEN_INCLUDE_REFERENCE_TEXT default: 0  (set 1 to send the matching .txt transcript as cloning prompt/reference text)
   QWEN_PREBUILD_VOICE_CLONE_PROMPT default: 0  (set 1 to prebuild voice_clone_prompt when transcript prompting is enabled)
+  QWEN_MAX_NEW_TOKENS default: 256  (caps decode length to prevent open-ended synthesis stalls)
   QWEN_AUTOMIX_FP32   default: 0  (kept for compatibility; model dtype defaults to fp32 anyway)
   QWEN_FORCE_FP32     default: 1  (set 0 to try fp16 again)
   QWEN_PLAY_Q_MAX     default: 100
@@ -127,6 +129,7 @@ DEFAULT_INSTRUCT = os.environ.get(
 
 TRAIN_WAV_PATH = os.environ.get("QWEN_TRAIN_WAV", "train.wav").strip()
 TRAIN_TXT_PATH = os.environ.get("QWEN_TRAIN_TXT", "train.txt").strip()
+ENABLE_LEGACY_TRAINING = os.environ.get("QWEN_ENABLE_LEGACY_TRAINING", "0").strip().lower() in ("1", "true", "yes", "on")
 ALLOW_SPEAKER_WITH_TRAIN = os.environ.get("QWEN_ALLOW_SPEAKER_WITH_TRAIN", "0").strip().lower() in (
     "1", "true", "yes", "on"
 )
@@ -136,6 +139,7 @@ PROMPT_TEXT_ARG_OVERRIDE = os.environ.get("QWEN_PROMPT_TEXT_ARG", "").strip()
 REQUIRE_TRAINING_FILES = os.environ.get("QWEN_REQUIRE_TRAINING_FILES", "0").strip().lower() in ("1", "true", "yes", "on")
 INCLUDE_REFERENCE_TEXT = os.environ.get("QWEN_INCLUDE_REFERENCE_TEXT", "0").strip().lower() in ("1", "true", "yes", "on")
 PREBUILD_VOICE_CLONE_PROMPT = os.environ.get("QWEN_PREBUILD_VOICE_CLONE_PROMPT", "0").strip().lower() in ("1", "true", "yes", "on")
+MAX_NEW_TOKENS = max(1, int(os.environ.get("QWEN_MAX_NEW_TOKENS", "256")))
 
 # Generation kwargs (best effort; still force greedy via generation_config)
 GEN_KWARGS = {
@@ -143,6 +147,7 @@ GEN_KWARGS = {
     "num_beams": 1,
     "temperature": 1.0,
     "top_p": 1.0,
+    "max_new_tokens": MAX_NEW_TOKENS,
 }
 
 PRINT_PREFIX = "[qwen-speak]"
@@ -443,11 +448,10 @@ def _build_voice_clone_kwargs_for_paths(wav_path: str, txt_path: str) -> dict:
     elif "reference_audio" in _GEN_VOICE_CLONE_PARAMS:
         kwargs["reference_audio"] = wav_path
 
-    if INCLUDE_REFERENCE_TEXT:
-        if _GEN_VOICE_CLONE_ACCEPTS_VAR_KW or "ref_text" in _GEN_VOICE_CLONE_PARAMS:
-            kwargs["ref_text"] = transcript
-        elif "reference_text" in _GEN_VOICE_CLONE_PARAMS:
-            kwargs["reference_text"] = transcript
+    if _GEN_VOICE_CLONE_ACCEPTS_VAR_KW or "ref_text" in _GEN_VOICE_CLONE_PARAMS:
+        kwargs["ref_text"] = transcript
+    elif "reference_text" in _GEN_VOICE_CLONE_PARAMS:
+        kwargs["reference_text"] = transcript
 
     can_pass_cached_prompt = _GEN_VOICE_CLONE_ACCEPTS_VAR_KW or "voice_clone_prompt" in _GEN_VOICE_CLONE_PARAMS
     if kwargs and INCLUDE_REFERENCE_TEXT and PREBUILD_VOICE_CLONE_PROMPT and _HAS_CREATE_VOICE_CLONE_PROMPT and can_pass_cached_prompt:
@@ -470,7 +474,7 @@ def _build_voice_clone_kwargs_for_paths(wav_path: str, txt_path: str) -> dict:
             f"startup: voice cloning reference ready wav={wav_path} txt={txt_path} keys={sorted(kwargs.keys())}"
         )
         if not INCLUDE_REFERENCE_TEXT:
-            status("startup: generate_voice_clone using audio-only reference inputs")
+            status("startup: generate_voice_clone keeps transcript reference for API compatibility; prompt-based conditioning remains disabled")
     else:
         status(
             "startup: generate_voice_clone present but no compatible ref kwargs detected; "
@@ -551,20 +555,24 @@ def _load_local_clone_voices() -> dict[str, LocalCloneVoice]:
     return loaded
 
 
-try:
-    TRAINING_VOICE_KWARGS = _build_training_voice_kwargs()
-except FileNotFoundError as e:
-    if REQUIRE_TRAINING_FILES:
-        raise
-    status(f"startup: training voice prompt files not found; continuing without clone prompt ({e})")
-    TRAINING_VOICE_KWARGS = {}
+if ENABLE_LEGACY_TRAINING:
+    try:
+        TRAINING_VOICE_KWARGS = _build_training_voice_kwargs()
+    except FileNotFoundError as e:
+        if REQUIRE_TRAINING_FILES:
+            raise
+        status(f"startup: training voice prompt files not found; continuing without clone prompt ({e})")
+        TRAINING_VOICE_KWARGS = {}
 
-try:
-    VOICE_CLONE_KWARGS = _build_voice_clone_kwargs()
-except FileNotFoundError as e:
-    if REQUIRE_TRAINING_FILES:
-        raise
-    status(f"startup: voice clone reference files not found; continuing without clone refs ({e})")
+    try:
+        VOICE_CLONE_KWARGS = _build_voice_clone_kwargs()
+    except FileNotFoundError as e:
+        if REQUIRE_TRAINING_FILES:
+            raise
+        status(f"startup: voice clone reference files not found; continuing without clone refs ({e})")
+        VOICE_CLONE_KWARGS = {}
+else:
+    TRAINING_VOICE_KWARGS = {}
     VOICE_CLONE_KWARGS = {}
 
 LOCAL_CLONE_VOICES = _load_local_clone_voices()
@@ -594,7 +602,7 @@ except Exception:
     SUPPORTED_SPEAKERS = []
 
 status(
-    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} local_clone_voices={len(LOCAL_CLONE_VOICES)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} chunk_gen_timeout_s={CHUNK_GEN_TIMEOUT_SECONDS:g} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f} synth_acquire_timeout_s={SYNTH_ACQUIRE_TIMEOUT_SECONDS:g} busy_status={SYNTH_BUSY_STATUS_CODE}"
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} local_clone_voices={len(LOCAL_CLONE_VOICES)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} chunk_gen_timeout_s={CHUNK_GEN_TIMEOUT_SECONDS:g} max_new_tokens={MAX_NEW_TOKENS} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f} synth_acquire_timeout_s={SYNTH_ACQUIRE_TIMEOUT_SECONDS:g} busy_status={SYNTH_BUSY_STATUS_CODE}"
 )
 
 
@@ -904,6 +912,11 @@ def _synthesize_to_audio(
         f"text_preview={_log_text_preview(text)!r})"
     )
     status(f"speak: runtime model device={current_dev}")
+    if local_clone_voice is not None:
+        status(
+            f"speak: local clone voice files voice={local_clone_voice.name!r} "
+            f"wav_path={local_clone_voice.wav_path!r} txt_path={local_clone_voice.txt_path!r}"
+        )
 
     if use_voice_clone_api:
         clone_kwargs = {
