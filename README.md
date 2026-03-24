@@ -36,6 +36,15 @@ Each local clone voice requires:
 - `<name>.wav`
 - `<name>.txt`
 
+By default, the server now uses the `.wav` as the cloning reference and does not send the
+matching `.txt` transcript back into the model as prompt text. This avoids the common failure
+mode where the training phrase is spoken before the requested text.
+
+If you explicitly want transcript-conditioned cloning again, set:
+
+- `QWEN_INCLUDE_REFERENCE_TEXT=1`
+- optionally `QWEN_PREBUILD_VOICE_CLONE_PROMPT=1`
+
 ## Startup voice snippet training
 
 On startup, the server now attempts to load a training voice snippet and transcript,

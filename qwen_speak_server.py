@@ -24,6 +24,8 @@ Env overrides:
   QWEN_LANG           default: english
   QWEN_INSTRUCT       default: "Read the text clearly, naturally, and conversationally."
   QWEN_VOICE_DIRS     optional path list of directories scanned for local clone voices (*.wav + matching *.txt)
+  QWEN_INCLUDE_REFERENCE_TEXT default: 0  (set 1 to send the matching .txt transcript as cloning prompt/reference text)
+  QWEN_PREBUILD_VOICE_CLONE_PROMPT default: 0  (set 1 to prebuild voice_clone_prompt when transcript prompting is enabled)
   QWEN_AUTOMIX_FP32   default: 0  (kept for compatibility; model dtype defaults to fp32 anyway)
   QWEN_FORCE_FP32     default: 1  (set 0 to try fp16 again)
   QWEN_PLAY_Q_MAX     default: 100
@@ -132,6 +134,8 @@ FORCE_CUSTOM_SPEAKER = os.environ.get("QWEN_FORCE_CUSTOM_SPEAKER", "custom").str
 PROMPT_AUDIO_ARG_OVERRIDE = os.environ.get("QWEN_PROMPT_AUDIO_ARG", "").strip()
 PROMPT_TEXT_ARG_OVERRIDE = os.environ.get("QWEN_PROMPT_TEXT_ARG", "").strip()
 REQUIRE_TRAINING_FILES = os.environ.get("QWEN_REQUIRE_TRAINING_FILES", "0").strip().lower() in ("1", "true", "yes", "on")
+INCLUDE_REFERENCE_TEXT = os.environ.get("QWEN_INCLUDE_REFERENCE_TEXT", "0").strip().lower() in ("1", "true", "yes", "on")
+PREBUILD_VOICE_CLONE_PROMPT = os.environ.get("QWEN_PREBUILD_VOICE_CLONE_PROMPT", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # Generation kwargs (best effort; still force greedy via generation_config)
 GEN_KWARGS = {
@@ -321,6 +325,9 @@ def _build_training_voice_kwargs_for_paths(wav_path: str, txt_path: str) -> dict
     transcript = _load_transcript(txt_path)
 
     kwargs: dict = {}
+    prompt_payload = {"audio": wav_path}
+    if INCLUDE_REFERENCE_TEXT:
+        prompt_payload["text"] = transcript
 
     audio_arg_candidates = [
         "prompt_audio",
@@ -354,10 +361,11 @@ def _build_training_voice_kwargs_for_paths(wav_path: str, txt_path: str) -> dict
     if _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW:
         # For wrapper APIs that accept **kwargs, keep prompt keys minimal to avoid ambiguous collisions.
         chosen_audio_key = PROMPT_AUDIO_ARG_OVERRIDE or audio_arg_candidates[0]
-        chosen_text_key = PROMPT_TEXT_ARG_OVERRIDE or text_arg_candidates[0]
         kwargs[chosen_audio_key] = wav_path
-        kwargs[chosen_text_key] = transcript
-        kwargs["voice_prompt"] = {"audio": wav_path, "text": transcript}
+        if INCLUDE_REFERENCE_TEXT:
+            chosen_text_key = PROMPT_TEXT_ARG_OVERRIDE or text_arg_candidates[0]
+            kwargs[chosen_text_key] = transcript
+        kwargs["voice_prompt"] = dict(prompt_payload)
     else:
         if PROMPT_AUDIO_ARG_OVERRIDE:
             if PROMPT_AUDIO_ARG_OVERRIDE in _GEN_CUSTOM_VOICE_PARAMS:
@@ -373,29 +381,30 @@ def _build_training_voice_kwargs_for_paths(wav_path: str, txt_path: str) -> dict
                 kwargs[key] = wav_path
                 break
 
-        if PROMPT_TEXT_ARG_OVERRIDE:
-            if PROMPT_TEXT_ARG_OVERRIDE in _GEN_CUSTOM_VOICE_PARAMS:
-                kwargs[PROMPT_TEXT_ARG_OVERRIDE] = transcript
-            else:
-                status(
-                    f"startup: ignored QWEN_PROMPT_TEXT_ARG={PROMPT_TEXT_ARG_OVERRIDE} (not in supported params)"
-                )
-        for key in text_arg_candidates:
-            if any(k in kwargs for k in text_arg_candidates + [PROMPT_TEXT_ARG_OVERRIDE]):
-                break
-            if key in _GEN_CUSTOM_VOICE_PARAMS:
-                kwargs[key] = transcript
-                break
+        if INCLUDE_REFERENCE_TEXT:
+            if PROMPT_TEXT_ARG_OVERRIDE:
+                if PROMPT_TEXT_ARG_OVERRIDE in _GEN_CUSTOM_VOICE_PARAMS:
+                    kwargs[PROMPT_TEXT_ARG_OVERRIDE] = transcript
+                else:
+                    status(
+                        f"startup: ignored QWEN_PROMPT_TEXT_ARG={PROMPT_TEXT_ARG_OVERRIDE} (not in supported params)"
+                    )
+            for key in text_arg_candidates:
+                if any(k in kwargs for k in text_arg_candidates + [PROMPT_TEXT_ARG_OVERRIDE]):
+                    break
+                if key in _GEN_CUSTOM_VOICE_PARAMS:
+                    kwargs[key] = transcript
+                    break
 
     # Some APIs use a structured prompt object instead of separate fields.
     structured_prompt_candidates = ["voice_prompt", "prompt", "reference"]
     if not kwargs and not _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW:
         for key in structured_prompt_candidates:
             if key in _GEN_CUSTOM_VOICE_PARAMS:
-                kwargs[key] = {"audio": wav_path, "text": transcript}
+                kwargs[key] = dict(prompt_payload)
                 break
     elif _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW:
-        kwargs["voice_prompt"] = {"audio": wav_path, "text": transcript}
+        kwargs["voice_prompt"] = dict(prompt_payload)
 
     if not kwargs:
         status(
@@ -406,6 +415,8 @@ def _build_training_voice_kwargs_for_paths(wav_path: str, txt_path: str) -> dict
         status(
             f"startup: voice cloning prompt ready wav={wav_path} txt={txt_path} keys={sorted(kwargs.keys())}"
         )
+        if not INCLUDE_REFERENCE_TEXT:
+            status("startup: reference transcript prompting disabled; using audio-only clone conditioning")
         if _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW:
             status("startup: generate_custom_voice accepts **kwargs; sending minimal prompt key set")
 
@@ -432,13 +443,14 @@ def _build_voice_clone_kwargs_for_paths(wav_path: str, txt_path: str) -> dict:
     elif "reference_audio" in _GEN_VOICE_CLONE_PARAMS:
         kwargs["reference_audio"] = wav_path
 
-    if _GEN_VOICE_CLONE_ACCEPTS_VAR_KW or "ref_text" in _GEN_VOICE_CLONE_PARAMS:
-        kwargs["ref_text"] = transcript
-    elif "reference_text" in _GEN_VOICE_CLONE_PARAMS:
-        kwargs["reference_text"] = transcript
+    if INCLUDE_REFERENCE_TEXT:
+        if _GEN_VOICE_CLONE_ACCEPTS_VAR_KW or "ref_text" in _GEN_VOICE_CLONE_PARAMS:
+            kwargs["ref_text"] = transcript
+        elif "reference_text" in _GEN_VOICE_CLONE_PARAMS:
+            kwargs["reference_text"] = transcript
 
     can_pass_cached_prompt = _GEN_VOICE_CLONE_ACCEPTS_VAR_KW or "voice_clone_prompt" in _GEN_VOICE_CLONE_PARAMS
-    if kwargs and _HAS_CREATE_VOICE_CLONE_PROMPT and can_pass_cached_prompt:
+    if kwargs and INCLUDE_REFERENCE_TEXT and PREBUILD_VOICE_CLONE_PROMPT and _HAS_CREATE_VOICE_CLONE_PROMPT and can_pass_cached_prompt:
         prompt_kwargs = dict(kwargs)
         if not _CREATE_VOICE_CLONE_PROMPT_ACCEPTS_VAR_KW:
             prompt_kwargs = {k: v for k, v in prompt_kwargs.items() if k in _CREATE_VOICE_CLONE_PROMPT_PARAMS}
@@ -457,6 +469,8 @@ def _build_voice_clone_kwargs_for_paths(wav_path: str, txt_path: str) -> dict:
         status(
             f"startup: voice cloning reference ready wav={wav_path} txt={txt_path} keys={sorted(kwargs.keys())}"
         )
+        if not INCLUDE_REFERENCE_TEXT:
+            status("startup: generate_voice_clone using audio-only reference inputs")
     else:
         status(
             "startup: generate_voice_clone present but no compatible ref kwargs detected; "
