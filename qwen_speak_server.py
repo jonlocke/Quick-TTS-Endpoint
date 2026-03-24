@@ -2,13 +2,14 @@
 """
 Qwen3-TTS local /speak server for AImaster (qwen-tts)
 
-- POST /speak {"text":"..."}  -> by default: queues playback (FIFO) and returns JSON
+- POST /speak {"text":"...", "voice":"liz"}  -> by default: queues playback (FIFO) and returns JSON
   Query params:
     play=1|0         (default 1)  queue server-side playback via ffplay
     return_audio=1|0 (default 0)  return audio/wav bytes (all chunks concatenated) instead of JSON
     chunk=1|0        (default 1)  split into sentence-ish chunks for earlier playback
     max_chars=N      (default 240) chunk size cap
 
+- GET /voices
 - GET /speakers
 - GET /languages
 - GET /health
@@ -22,6 +23,7 @@ Env overrides:
   QWEN_SPEAKER        default: ryan
   QWEN_LANG           default: english
   QWEN_INSTRUCT       default: "Read the text clearly, naturally, and conversationally."
+  QWEN_VOICE_DIRS     optional path list of directories scanned for local clone voices (*.wav + matching *.txt)
   QWEN_AUTOMIX_FP32   default: 0  (kept for compatibility; model dtype defaults to fp32 anyway)
   QWEN_FORCE_FP32     default: 1  (set 0 to try fp16 again)
   QWEN_PLAY_Q_MAX     default: 100
@@ -47,6 +49,7 @@ import time
 import queue
 import traceback
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Query
@@ -153,6 +156,7 @@ app = FastAPI()
 
 class SpeakReq(BaseModel):
     text: str
+    voice: Optional[str] = None
     speaker: Optional[str] = None
     language: Optional[str] = None
     instruct: Optional[str] = None
@@ -160,6 +164,23 @@ class SpeakReq(BaseModel):
 
 def status(step: str):
     print(f"{PRINT_PREFIX} {step}", flush=True)
+
+
+@dataclass(frozen=True)
+class LocalCloneVoice:
+    name: str
+    wav_path: str
+    txt_path: str
+    transcript: str
+    training_kwargs: dict
+    voice_clone_kwargs: dict
+
+
+def _log_text_preview(text: str, limit: int = 10) -> str:
+    preview = re.sub(r"\s+", " ", (text or "").strip())
+    if len(preview) <= limit:
+        return preview
+    return preview[:limit] + "..."
 
 
 def _acquire_synth_slot_or_busy() -> None:
@@ -288,15 +309,16 @@ def _resolve_training_paths() -> tuple[str, str]:
     )
 
 
-def _build_training_voice_kwargs() -> dict:
-    """Load startup voice snippet and map it into supported qwen-tts kwargs."""
-    status("startup: loading voice clone prompt files")
-    wav_path, txt_path = _resolve_training_paths()
-
+def _load_transcript(txt_path: str) -> str:
     with open(txt_path, "r", encoding="utf-8") as f:
         transcript = f.read().strip()
     if not transcript:
         raise RuntimeError(f"Training text file is empty: {txt_path}")
+    return transcript
+
+
+def _build_training_voice_kwargs_for_paths(wav_path: str, txt_path: str) -> dict:
+    transcript = _load_transcript(txt_path)
 
     kwargs: dict = {}
 
@@ -390,16 +412,19 @@ def _build_training_voice_kwargs() -> dict:
     return kwargs
 
 
-def _build_voice_clone_kwargs() -> dict:
+def _build_training_voice_kwargs() -> dict:
+    """Load startup voice snippet and map it into supported qwen-tts kwargs."""
+    status("startup: loading voice clone prompt files")
+    wav_path, txt_path = _resolve_training_paths()
+    return _build_training_voice_kwargs_for_paths(wav_path, txt_path)
+
+
+def _build_voice_clone_kwargs_for_paths(wav_path: str, txt_path: str) -> dict:
     """Load startup voice snippet and map into generate_voice_clone kwargs."""
     if not _HAS_GEN_VOICE_CLONE:
         return {}
 
-    wav_path, txt_path = _resolve_training_paths()
-    with open(txt_path, "r", encoding="utf-8") as f:
-        transcript = f.read().strip()
-    if not transcript:
-        raise RuntimeError(f"Training text file is empty: {txt_path}")
+    transcript = _load_transcript(txt_path)
 
     kwargs = {}
     if _GEN_VOICE_CLONE_ACCEPTS_VAR_KW or "ref_audio" in _GEN_VOICE_CLONE_PARAMS:
@@ -440,6 +465,78 @@ def _build_voice_clone_kwargs() -> dict:
     return kwargs
 
 
+def _build_voice_clone_kwargs() -> dict:
+    wav_path, txt_path = _resolve_training_paths()
+    return _build_voice_clone_kwargs_for_paths(wav_path, txt_path)
+
+
+def _voice_search_dirs() -> list[Path]:
+    raw_dirs = os.environ.get("QWEN_VOICE_DIRS", "").strip()
+    candidate_dirs: list[Path] = []
+    if raw_dirs:
+        for entry in raw_dirs.split(os.pathsep):
+            cleaned = entry.strip()
+            if cleaned:
+                candidate_dirs.append(Path(cleaned).expanduser())
+
+    candidate_dirs.append(Path.cwd())
+    candidate_dirs.append(Path(__file__).resolve().parent)
+
+    seen: set[str] = set()
+    unique_dirs: list[Path] = []
+    for directory in candidate_dirs:
+        resolved = str(directory.resolve())
+        if resolved not in seen:
+            seen.add(resolved)
+            unique_dirs.append(directory)
+    return unique_dirs
+
+
+def _discover_local_clone_voice_pairs() -> dict[str, tuple[str, str]]:
+    voice_pairs: dict[str, tuple[str, str]] = {}
+
+    for directory in _voice_search_dirs():
+        if not directory.is_dir():
+            continue
+        for wav_path in sorted(directory.glob("*.wav")):
+            txt_path = wav_path.with_suffix(".txt")
+            if not txt_path.is_file():
+                continue
+            voice_name = wav_path.stem.strip().lower()
+            if voice_name and voice_name not in voice_pairs:
+                voice_pairs[voice_name] = (str(wav_path), str(txt_path))
+
+    try:
+        wav_path, txt_path = _resolve_training_paths()
+        configured_voice_name = Path(wav_path).stem.strip().lower()
+        if configured_voice_name and configured_voice_name not in voice_pairs:
+            voice_pairs[configured_voice_name] = (wav_path, txt_path)
+    except FileNotFoundError:
+        pass
+
+    return voice_pairs
+
+
+def _load_local_clone_voices() -> dict[str, LocalCloneVoice]:
+    loaded: dict[str, LocalCloneVoice] = {}
+
+    for voice_name, (wav_path, txt_path) in _discover_local_clone_voice_pairs().items():
+        try:
+            transcript = _load_transcript(txt_path)
+            loaded[voice_name] = LocalCloneVoice(
+                name=voice_name,
+                wav_path=wav_path,
+                txt_path=txt_path,
+                transcript=transcript,
+                training_kwargs=_build_training_voice_kwargs_for_paths(wav_path, txt_path),
+                voice_clone_kwargs=_build_voice_clone_kwargs_for_paths(wav_path, txt_path),
+            )
+        except Exception as exc:
+            status(f"startup: skipping local voice '{voice_name}' because it could not be prepared ({exc})")
+
+    return loaded
+
+
 try:
     TRAINING_VOICE_KWARGS = _build_training_voice_kwargs()
 except FileNotFoundError as e:
@@ -455,6 +552,12 @@ except FileNotFoundError as e:
         raise
     status(f"startup: voice clone reference files not found; continuing without clone refs ({e})")
     VOICE_CLONE_KWARGS = {}
+
+LOCAL_CLONE_VOICES = _load_local_clone_voices()
+status(
+    "startup: local clone voices="
+    + (", ".join(sorted(LOCAL_CLONE_VOICES)) if LOCAL_CLONE_VOICES else "none")
+)
 
 # Force greedy decoding on internal components (critical for stability)
 try:
@@ -477,7 +580,7 @@ except Exception:
     SUPPORTED_SPEAKERS = []
 
 status(
-    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} chunk_gen_timeout_s={CHUNK_GEN_TIMEOUT_SECONDS:g} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f} synth_acquire_timeout_s={SYNTH_ACQUIRE_TIMEOUT_SECONDS:g} busy_status={SYNTH_BUSY_STATUS_CODE}"
+    f"startup: ready speakers={len(SUPPORTED_SPEAKERS)} local_clone_voices={len(LOCAL_CLONE_VOICES)} languages={len(SUPPORTED_LANGS)} voice_prompt={'on' if bool(TRAINING_VOICE_KWARGS) else 'off'} voice_clone_api={'on' if _HAS_GEN_VOICE_CLONE else 'off'} cached_voice_clone_prompt={'on' if ('voice_clone_prompt' in VOICE_CLONE_KWARGS) else 'off'} gpu_synth_concurrency={GPU_SYNTH_CONCURRENCY} chunk_gen_timeout_s={CHUNK_GEN_TIMEOUT_SECONDS:g} fp16_retry_fp32={'on' if FP16_RETRY_FP32 else 'off'} cuda_cache_clear_policy={CUDA_CACHE_CLEAR_POLICY} cuda_pressure_threshold={CUDA_CACHE_PRESSURE_THRESHOLD:.3f} synth_acquire_timeout_s={SYNTH_ACQUIRE_TIMEOUT_SECONDS:g} busy_status={SYNTH_BUSY_STATUS_CODE}"
 )
 
 
@@ -490,6 +593,7 @@ def health():
         "dtype": str(DTYPE),
         "queue_depth": play_q.qsize(),
         "supported_speakers": len(SUPPORTED_SPEAKERS),
+        "local_clone_voices": len(LOCAL_CLONE_VOICES),
         "supported_languages": len(SUPPORTED_LANGS),
     }
 
@@ -502,6 +606,15 @@ def languages():
 @app.get("/speakers")
 def speakers():
     return {"speakers": SUPPORTED_SPEAKERS}
+
+
+@app.get("/voices")
+def voices():
+    return {
+        "voices": sorted(LOCAL_CLONE_VOICES),
+        "default_voice": DEFAULT_SPEAKER,
+        "builtin_speakers": SUPPORTED_SPEAKERS,
+    }
 
 
 def _concat_audio(chunks: list[np.ndarray]) -> np.ndarray:
@@ -747,25 +860,48 @@ def _run_generation_with_fp16_retry(gen_fn, kwargs: dict, label: str):
 
 
 
-def _synthesize_to_audio(text: str, speaker: str, language: str, instruct: str) -> Tuple[np.ndarray, int]:
+def _resolve_requested_voice(requested_voice: str) -> tuple[str, Optional[LocalCloneVoice], str]:
+    normalized = (requested_voice or DEFAULT_SPEAKER).strip().lower()
+    local_clone_voice = LOCAL_CLONE_VOICES.get(normalized)
+    if local_clone_voice is not None:
+        return normalized, local_clone_voice, "local_clone"
+    return normalized, None, "builtin_speaker"
+
+
+def _synthesize_to_audio(
+    text: str,
+    speaker: str,
+    language: str,
+    instruct: str,
+    local_clone_voice: Optional[LocalCloneVoice] = None,
+) -> Tuple[np.ndarray, int]:
     current_dev = _ensure_model_cuda()
-    use_voice_clone_api = bool(VOICE_CLONE_KWARGS) and _HAS_GEN_VOICE_CLONE
-    is_cloned_voice = use_voice_clone_api or bool(TRAINING_VOICE_KWARGS)
-    speaker_label = "cloned" if is_cloned_voice else speaker
-    status(f"speak: cloning voice (len={len(text)} chars, speaker={speaker_label}, language={language})")
+    active_voice_clone_kwargs = (
+        local_clone_voice.voice_clone_kwargs if local_clone_voice is not None else VOICE_CLONE_KWARGS
+    )
+    active_training_voice_kwargs = (
+        local_clone_voice.training_kwargs if local_clone_voice is not None else TRAINING_VOICE_KWARGS
+    )
+    use_voice_clone_api = bool(active_voice_clone_kwargs) and _HAS_GEN_VOICE_CLONE
+    is_cloned_voice = use_voice_clone_api or bool(active_training_voice_kwargs)
+    speaker_label = local_clone_voice.name if local_clone_voice is not None else ("cloned" if is_cloned_voice else speaker)
+    status(
+        f"speak: cloning voice (len={len(text)} chars, speaker={speaker_label}, language={language}, "
+        f"text_preview={_log_text_preview(text)!r})"
+    )
     status(f"speak: runtime model device={current_dev}")
 
     if use_voice_clone_api:
         clone_kwargs = {
             "text": text,
             "language": language,
-            **VOICE_CLONE_KWARGS,
+            **active_voice_clone_kwargs,
             **GEN_KWARGS,
         }
         if not _GEN_VOICE_CLONE_ACCEPTS_VAR_KW:
             clone_kwargs = {k: v for k, v in clone_kwargs.items() if k in _GEN_VOICE_CLONE_PARAMS}
 
-        sent_ref_keys = [k for k in clone_kwargs if k in VOICE_CLONE_KWARGS]
+        sent_ref_keys = [k for k in clone_kwargs if k in active_voice_clone_kwargs]
         status(f"speak: using generate_voice_clone ref args={sorted(sent_ref_keys)}")
 
         audio_list, sr = _run_generation_with_fp16_retry(
@@ -786,12 +922,12 @@ def _synthesize_to_audio(text: str, speaker: str, language: str, instruct: str) 
         "language": language,
         "instruct": instruct,
         "non_streaming_mode": True,
-        **TRAINING_VOICE_KWARGS,
+        **active_training_voice_kwargs,
         **GEN_KWARGS,
     }
 
     # When using a startup voice prompt, most qwen-tts variants should avoid a fixed built-in speaker.
-    if TRAINING_VOICE_KWARGS and not ALLOW_SPEAKER_WITH_TRAIN:
+    if active_training_voice_kwargs and not ALLOW_SPEAKER_WITH_TRAIN:
         if "speaker" in _GEN_CUSTOM_VOICE_PARAMS and FORCE_CUSTOM_SPEAKER:
             if SUPPORTED_SPEAKERS and FORCE_CUSTOM_SPEAKER.lower() not in SUPPORTED_SPEAKERS:
                 fallback_speaker = speaker or DEFAULT_SPEAKER
@@ -816,7 +952,7 @@ def _synthesize_to_audio(text: str, speaker: str, language: str, instruct: str) 
     if not _GEN_CUSTOM_VOICE_ACCEPTS_VAR_KW:
         call_kwargs = {k: v for k, v in call_kwargs.items() if k in _GEN_CUSTOM_VOICE_PARAMS}
 
-    prompt_keys_sent = [k for k in call_kwargs if k in TRAINING_VOICE_KWARGS]
+    prompt_keys_sent = [k for k in call_kwargs if k in active_training_voice_kwargs]
     status(f"speak: voice prompt args in call={sorted(prompt_keys_sent)}")
 
     audio_list, sr = _run_generation_with_fp16_retry(
@@ -833,12 +969,18 @@ def _synthesize_to_audio(text: str, speaker: str, language: str, instruct: str) 
     return wav, int(sr)
 
 
-def _synthesize_to_audio_with_timeout(text: str, speaker: str, language: str, instruct: str) -> Tuple[np.ndarray, int]:
+def _synthesize_to_audio_with_timeout(
+    text: str,
+    speaker: str,
+    language: str,
+    instruct: str,
+    local_clone_voice: Optional[LocalCloneVoice] = None,
+) -> Tuple[np.ndarray, int]:
     """Run chunk synthesis with a hard timeout bail-out."""
     if CHUNK_GEN_TIMEOUT_SECONDS <= 0:
-        return _synthesize_to_audio(text, speaker, language, instruct)
+        return _synthesize_to_audio(text, speaker, language, instruct, local_clone_voice=local_clone_voice)
 
-    future = synth_pool.submit(_synthesize_to_audio, text, speaker, language, instruct)
+    future = synth_pool.submit(_synthesize_to_audio, text, speaker, language, instruct, local_clone_voice)
     try:
         return future.result(timeout=CHUNK_GEN_TIMEOUT_SECONDS)
     except concurrent.futures.TimeoutError:
@@ -988,18 +1130,26 @@ def speak(
     max_chars: int = Query(240, ge=80, le=800, description="Chunk size cap"),
 ):
     request_start = time.perf_counter()
-    status("speak: request received")
 
     raw_text = (req.text or "").strip()
     if not raw_text:
         return Response(status_code=204)
 
-    speaker = (req.speaker or DEFAULT_SPEAKER).strip().lower()
+    requested_voice = (req.voice or req.speaker or DEFAULT_SPEAKER).strip().lower()
+    speaker, local_clone_voice, resolved_voice_type = _resolve_requested_voice(requested_voice)
     language = (req.language or DEFAULT_LANG).strip().lower()
     instruct = (req.instruct or DEFAULT_INSTRUCT).strip()
+    status(
+        f"speak: request received voice={requested_voice!r} resolved_voice={speaker!r} "
+        f"voice_type={resolved_voice_type} text_preview={_log_text_preview(raw_text)!r}"
+    )
 
-    if SUPPORTED_SPEAKERS and speaker not in SUPPORTED_SPEAKERS:
-        raise HTTPException(status_code=400, detail=f"Unsupported speaker '{speaker}'. Use GET /speakers")
+    if local_clone_voice is None and SUPPORTED_SPEAKERS and speaker not in SUPPORTED_SPEAKERS:
+        available_local_voices = sorted(LOCAL_CLONE_VOICES)
+        hint = "Use GET /speakers"
+        if available_local_voices:
+            hint += f" or GET /voices for local clone voices ({', '.join(available_local_voices[:10])})"
+        raise HTTPException(status_code=400, detail=f"Unsupported speaker/voice '{speaker}'. {hint}")
     if SUPPORTED_LANGS and language not in SUPPORTED_LANGS:
         raise HTTPException(status_code=400, detail=f"Unsupported language '{language}'. Use GET /languages")
 
@@ -1047,7 +1197,13 @@ def speak(
                     try:
                         if idx == 0 and first_word_latency_seconds is None:
                             first_word_latency_seconds = time.perf_counter() - request_start
-                        wav, sr = _synthesize_to_audio_with_timeout(part, speaker, language, instruct)
+                        wav, sr = _synthesize_to_audio_with_timeout(
+                            part,
+                            speaker,
+                            language,
+                            instruct,
+                            local_clone_voice=local_clone_voice,
+                        )
                     finally:
                         GPU_SYNTH_SEMAPHORE.release()
                         _maybe_compact_cuda_heap(stage="chunk")
@@ -1084,6 +1240,8 @@ def speak(
                     "message": completion_message,
                     "chunks": len(parts),
                     "speaker": speaker,
+                    "voice": speaker,
+                    "voice_type": resolved_voice_type,
                     "language": language,
                     "processing_seconds": round(total_latency_seconds, 3),
                     "latency_to_first_word_seconds": round(fw, 3),
@@ -1109,7 +1267,13 @@ def speak(
                 if idx == 0 and first_word_latency_seconds is None:
                     # First-word proxy: when first chunk is about to enter model inference.
                     first_word_latency_seconds = time.perf_counter() - request_start
-                wav, sr = _synthesize_to_audio_with_timeout(part, speaker, language, instruct)
+                wav, sr = _synthesize_to_audio_with_timeout(
+                    part,
+                    speaker,
+                    language,
+                    instruct,
+                    local_clone_voice=local_clone_voice,
+                )
             finally:
                 GPU_SYNTH_SEMAPHORE.release()
                 _maybe_compact_cuda_heap(stage="chunk")
@@ -1159,6 +1323,8 @@ def speak(
             headers={
                 "X-Qwen-Request-Status": "complete",
                 "X-Qwen-Speaker": speaker,
+                "X-Qwen-Voice": speaker,
+                "X-Qwen-Voice-Type": resolved_voice_type,
                 "X-Qwen-Language": language,
                 "X-Qwen-SampleRate": str(merged_sr),
                 "X-Qwen-Chunks": str(len(parts)),
@@ -1185,6 +1351,8 @@ def speak(
         "chunks": len(parts),
         "max_chars": max_chars,
         "speaker": speaker,
+        "voice": speaker,
+        "voice_type": resolved_voice_type,
         "language": language,
         "queue_depth": play_q.qsize(),
         "job_ids": job_ids[:10],  # avoid huge responses

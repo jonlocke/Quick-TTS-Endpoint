@@ -24,8 +24,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python3 -m venv "$VIRTUAL_ENV" && \
     python -m pip install --upgrade pip wheel setuptools
 
-COPY . /app
-
 ARG TORCH_VERSION=2.2.2+cu118
 ARG TORCHVISION_VERSION=0.17.2+cu118
 ARG TORCHAUDIO_VERSION=2.2.2+cu118
@@ -37,6 +35,8 @@ RUN python -m pip install --upgrade fastapi uvicorn soundfile "numpy<2" && \
       "torchaudio==${TORCHAUDIO_VERSION}" \
       --index-url https://download.pytorch.org/whl/cu118 && \
     python -m pip install --upgrade qwen-tts==0.1.0
+
+COPY . /app
 
 EXPOSE 8765
 

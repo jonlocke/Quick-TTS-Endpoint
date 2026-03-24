@@ -21,6 +21,8 @@ DOCKER_GPU_MODE="${DOCKER_GPU_MODE:-auto}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+VOICE_DIR_HOST="${VOICE_DIR_HOST:-${REPO_ROOT}/voices}"
+VOICE_DIR_CONTAINER="${VOICE_DIR_CONTAINER:-/voices}"
 
 if [[ "${MODEL_CACHE_HOST_DIR:-}" == "" || "${MODEL_CACHE_HOST_DIR}" == "${REPO_ROOT:-.}/.hf-cache" ]]; then
   MODEL_CACHE_HOST_DIR="${REPO_ROOT}/.hf-cache"
@@ -31,13 +33,18 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
-TRAIN_WAV="${QWEN_TRAIN_WAV:-${REPO_ROOT}/train.wav}"
-TRAIN_TXT="${QWEN_TRAIN_TXT:-${REPO_ROOT}/train.txt}"
+TRAIN_WAV="${QWEN_TRAIN_WAV:-${VOICE_DIR_HOST}/train.wav}"
+TRAIN_TXT="${QWEN_TRAIN_TXT:-${VOICE_DIR_HOST}/train.txt}"
 
 MOUNTS=()
+if [[ -d "${VOICE_DIR_HOST}" ]]; then
+  MOUNTS+=("-v" "${VOICE_DIR_HOST}:${VOICE_DIR_CONTAINER}:ro")
+fi
 if [[ -f "$TRAIN_WAV" && -f "$TRAIN_TXT" ]]; then
-  MOUNTS+=("-v" "${TRAIN_WAV}:/app/train.wav:ro" "-e" "QWEN_TRAIN_WAV=/app/train.wav")
-  MOUNTS+=("-v" "${TRAIN_TXT}:/app/train.txt:ro" "-e" "QWEN_TRAIN_TXT=/app/train.txt")
+  train_wav_basename="$(basename "${TRAIN_WAV}")"
+  train_txt_basename="$(basename "${TRAIN_TXT}")"
+  MOUNTS+=("-e" "QWEN_TRAIN_WAV=${VOICE_DIR_CONTAINER}/${train_wav_basename}")
+  MOUNTS+=("-e" "QWEN_TRAIN_TXT=${VOICE_DIR_CONTAINER}/${train_txt_basename}")
 elif [[ -f "$TRAIN_WAV" || -f "$TRAIN_TXT" ]]; then
   echo "Warning: partial training prompt files detected; both train.wav and train.txt are required to enable clone prompt." >&2
   echo "         Continuing without training prompt mounts." >&2
@@ -86,6 +93,9 @@ fi
 
 echo "Starting ${CONTAINER_NAME} on port ${HOST_PORT}"
 echo "Restart policy: ${RESTART_POLICY}"
+if [[ -d "${VOICE_DIR_HOST}" ]]; then
+  echo "Voice directory bind mount: ${VOICE_DIR_HOST} -> ${VOICE_DIR_CONTAINER}"
+fi
 if [[ "${PERSIST_MODEL_CACHE}" == "1" ]]; then
   echo "Persistent model cache bind mount: ${MODEL_CACHE_HOST_DIR} -> ${HUGGINGFACE_CACHE_DIR}"
 fi
@@ -101,6 +111,7 @@ CONTAINER_ID="$(docker run -d \
   -e QWEN_FORCE_FP32="${QWEN_FORCE_FP32:-1}" \
   -e QWEN_CUDA_CACHE_CLEAR_POLICY="${QWEN_CUDA_CACHE_CLEAR_POLICY:-pressure}" \
   -e QWEN_CUDA_CACHE_PRESSURE_THRESHOLD="${QWEN_CUDA_CACHE_PRESSURE_THRESHOLD:-0.98}" \
+  -e QWEN_VOICE_DIRS="${QWEN_VOICE_DIRS:-${VOICE_DIR_CONTAINER}}" \
   -e HF_HOME="${HUGGINGFACE_CACHE_DIR}" \
   -e HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_CACHE_DIR}" \
   "${IMAGE_NAME}:${IMAGE_TAG}")"

@@ -8,6 +8,34 @@ For convenience, common aliases (`qwen3-tts`, `qwen-tts`, `qwen3_tts`) are norma
 
 Note: startup now enforces CUDA-only execution and will raise `RuntimeError("CUDA not available, refusing CPU fallback")` if no GPU is available.
 
+## Local voice discovery and selection
+
+The server now exposes:
+
+- `GET /voices`: list local clone voices discovered from `*.wav` + matching `*.txt`
+- `GET /speakers`: list built-in model speakers
+
+Example: if the repo contains `liz.wav` and `liz.txt`, `/voices` will include `liz`.
+
+`POST /speak` now accepts either:
+
+- `"voice": "liz"` to use a discovered local clone voice
+- `"speaker": "ryan"` to use a built-in model speaker
+
+For compatibility, if `voice` is omitted, the server still accepts `speaker`, and it will
+first try to match a local clone voice by that name before falling back to a built-in speaker.
+
+Voice files are discovered from:
+
+1. `QWEN_VOICE_DIRS` if set, split using the platform path separator
+2. the current working directory
+3. the repository/script directory
+
+Each local clone voice requires:
+
+- `<name>.wav`
+- `<name>.txt`
+
 ## Startup voice snippet training
 
 On startup, the server now attempts to load a training voice snippet and transcript,
@@ -29,8 +57,9 @@ You can override paths with:
 If training files are missing, startup now continues without voice-clone prompt inputs.
 Set `QWEN_REQUIRE_TRAINING_FILES=1` to make missing files a hard startup error.
 
-When training prompt files are present, the server defaults to clone-first behavior
-instead of a fixed built-in speaker. Optional tuning:
+When startup training prompt files are present, the server defaults to clone-first behavior
+instead of a fixed built-in speaker unless the request selects another local voice or built-in speaker.
+Optional tuning:
 
 - `QWEN_ALLOW_SPEAKER_WITH_TRAIN=1` to keep passing request/default speaker
 - `QWEN_FORCE_CUSTOM_SPEAKER` (default: `custom`) for APIs that need an explicit custom speaker label
